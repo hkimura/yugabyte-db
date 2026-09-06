@@ -5641,29 +5641,11 @@ Schema Tablet::GetKeySchema(const std::string& table_id) const {
 
 docdb::CompactionHybridTimeConstraints Tablet::CompactionHybridTimeConstraints(
     const std::vector<rocksdb::FileMetaData*>& inputs) {
-  docdb::CompactionHybridTimeConstraints result;
-  std::vector<uint64_t> input_names;
-  input_names.reserve(inputs.size());
-  for (const auto& file : inputs) {
-    input_names.push_back(file->fd.GetNumber());
-    if (!file->smallest.user_frontier) {
-      // Frontiers are reset on files imported by bulk load, otherwise it should not happen.
-      // In both cases consider input range as a full range.
-      LOG_IF(DFATAL, !file->imported) << "Input file without frontier: " << file->ToString();
-      result.input_min = HybridTime::kMin;
-      result.input_max = HybridTime::kMax;
-      continue;
-    }
-    auto& smallest = down_cast<docdb::ConsensusFrontier&>(*file->smallest.user_frontier);
-    // Hybrid time is defined by Raft hybrid time and commit hybrid time of all records.
-    result.input_min = std::min(result.input_min, smallest.hybrid_time());
-    auto& largest = down_cast<docdb::ConsensusFrontier&>(*file->largest.user_frontier);
-    result.input_max = std::max(result.input_max, largest.hybrid_time());
-  }
-
   auto scoped_read_operation = CreateScopedRWOperationBlockingRocksDbShutdownStart();
   if (!scoped_read_operation.ok()) {
     // Prevent markers from being deleted when we cannot calculate retention time during shutdown.
+    docdb::CompactionHybridTimeConstraints result;
+    docdb::SetCompactionInputHybridTimeRange(inputs, &result);
     result.other_min = HybridTime::kMin;
     result.repack_range_max = HybridTime::kMin;
     result.repack_range_min = HybridTime::kMax;
@@ -5673,44 +5655,14 @@ docdb::CompactionHybridTimeConstraints Tablet::CompactionHybridTimeConstraints(
   }
 
   // Query order is important. Since it is not atomic, we should be sure that write would not sneak
-  // our queries. So we follow write record travel order.
-
+  // our queries. So we follow write record travel order: running transactions here, then the
+  // memtable and the live files inside ComputeCompactionHybridTimeConstraints.
+  std::optional<HybridTime> min_running_txn_ht;
   if (transaction_participant_) {
-    auto min_running_ht = transaction_participant_->MinRunningHybridTime();
-    VLOG_WITH_PREFIX_AND_FUNC(4) << "min_running_ht: " << min_running_ht;
-    result.HandleOtherRange(min_running_ht, HybridTime::kMax);
+    min_running_txn_ht = transaction_participant_->MinRunningHybridTime();
   }
-
-  auto frontiers = regular_db_->GetInMemoryFrontiers();
-  if (frontiers.smallest) {
-    DCHECK_ONLY_NOTNULL(frontiers.largest.get());
-    VLOG_WITH_PREFIX_AND_FUNC(4)
-        << "Mem table frontiers: " << frontiers.smallest->ToString()
-        << "-" << frontiers.largest->ToString();
-    result.HandleOtherRange(*frontiers.smallest, *frontiers.largest);
-  }
-
-  auto files = regular_db_->GetLiveFilesMetaData();
-
-  std::ranges::sort(input_names);
-  for (const auto& file : files) {
-    if (std::ranges::binary_search(input_names, file.name_id)) {
-      continue;
-    }
-    if (!file.smallest.user_frontier) {
-      // This should not happen, so disable repacking and delete marker cleanup for safety.
-      LOG(DFATAL) << "Other file without frontier: " << file.ToString();
-      result.HandleOtherRange(HybridTime::kMin, HybridTime::kMax);
-      continue;
-    }
-    VLOG_WITH_PREFIX_AND_FUNC(4)
-        << file.name_id << " frontiers: " << file.smallest.user_frontier->ToString()
-        << "-" << file.largest.user_frontier->ToString();
-    result.HandleOtherRange(*file.smallest.user_frontier, *file.largest.user_frontier);
-  }
-
-  VLOG_WITH_PREFIX_AND_FUNC(3) << "Result: " << result.ToString();
-  return result;
+  return docdb::ComputeCompactionHybridTimeConstraints(
+      *regular_db_, inputs, min_running_txn_ht, LogPrefix());
 }
 
 Status Tablet::ProcessAutoFlagsConfigOperation(const AutoFlagsConfigPB& config) {

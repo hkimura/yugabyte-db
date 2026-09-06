@@ -13,7 +13,9 @@
 
 #include "yb/docdb/docdb_compaction_context.h"
 
+#include <algorithm>
 #include <memory>
+#include <optional>
 
 #include "yb/common/schema.h"
 #include "yb/docdb/consensus_frontier.h"
@@ -29,6 +31,8 @@
 #include "yb/dockv/value_type.h"
 
 #include "yb/rocksdb/compaction_filter.h"
+#include "yb/rocksdb/db.h"
+#include "yb/rocksdb/db/version_edit.h"
 
 #include "yb/util/memory/arena.h"
 #include "yb/util/fast_varint.h"
@@ -1871,6 +1875,74 @@ void CompactionHybridTimeConstraints::HandleOtherRange(
 
 std::string CompactionHybridTimeConstraints::ToString() const {
   return YB_STRUCT_TO_STRING(input_min, input_max, other_min, repack_range_min, repack_range_max);
+}
+
+void SetCompactionInputHybridTimeRange(
+    const std::vector<rocksdb::FileMetaData*>& inputs, CompactionHybridTimeConstraints* result) {
+  for (const auto& file : inputs) {
+    if (!file->smallest.user_frontier) {
+      // Frontiers are reset on files imported by bulk load, otherwise it should not happen.
+      // In both cases consider input range as a full range.
+      LOG_IF(DFATAL, !file->imported) << "Input file without frontier: " << file->ToString();
+      result->input_min = HybridTime::kMin;
+      result->input_max = HybridTime::kMax;
+      continue;
+    }
+    auto& smallest = down_cast<ConsensusFrontier&>(*file->smallest.user_frontier);
+    // Hybrid time is defined by Raft hybrid time and commit hybrid time of all records.
+    result->input_min = std::min(result->input_min, smallest.hybrid_time());
+    auto& largest = down_cast<ConsensusFrontier&>(*file->largest.user_frontier);
+    result->input_max = std::max(result->input_max, largest.hybrid_time());
+  }
+}
+
+CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
+    rocksdb::DB& db, const std::vector<rocksdb::FileMetaData*>& inputs,
+    std::optional<HybridTime> min_running_txn_ht, const std::string& log_prefix) {
+  CompactionHybridTimeConstraints result;
+  SetCompactionInputHybridTimeRange(inputs, &result);
+
+  // Query order is important. Since it is not atomic, we should be sure that write would not sneak
+  // our queries. So we follow write record travel order.
+  if (min_running_txn_ht) {
+    VLOG_WITH_FUNC(4) << log_prefix << "min_running_ht: " << *min_running_txn_ht;
+    result.HandleOtherRange(*min_running_txn_ht, HybridTime::kMax);
+  }
+
+  auto frontiers = db.GetInMemoryFrontiers();
+  if (frontiers.smallest) {
+    DCHECK_ONLY_NOTNULL(frontiers.largest.get());
+    VLOG_WITH_FUNC(4)
+        << log_prefix << "Mem table frontiers: " << frontiers.smallest->ToString()
+        << "-" << frontiers.largest->ToString();
+    result.HandleOtherRange(*frontiers.smallest, *frontiers.largest);
+  }
+
+  std::vector<uint64_t> input_names;
+  input_names.reserve(inputs.size());
+  for (const auto& file : inputs) {
+    input_names.push_back(file->fd.GetNumber());
+  }
+  std::ranges::sort(input_names);
+
+  for (const auto& file : db.GetLiveFilesMetaData()) {
+    if (std::ranges::binary_search(input_names, file.name_id)) {
+      continue;
+    }
+    if (!file.smallest.user_frontier) {
+      // This should not happen, so disable repacking and delete marker cleanup for safety.
+      LOG(DFATAL) << log_prefix << "Other file without frontier: " << file.ToString();
+      result.HandleOtherRange(HybridTime::kMin, HybridTime::kMax);
+      continue;
+    }
+    VLOG_WITH_FUNC(4)
+        << log_prefix << file.name_id << " frontiers: " << file.smallest.user_frontier->ToString()
+        << "-" << file.largest.user_frontier->ToString();
+    result.HandleOtherRange(*file.smallest.user_frontier, *file.largest.user_frontier);
+  }
+
+  VLOG_WITH_FUNC(3) << log_prefix << "Result: " << result.ToString();
+  return result;
 }
 
 }  // namespace yb::docdb

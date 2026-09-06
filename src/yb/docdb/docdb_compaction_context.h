@@ -15,6 +15,8 @@
 
 #include <atomic>
 #include <memory>
+#include <optional>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -204,6 +206,20 @@ struct CompactionHybridTimeConstraints {
 
 using CompactionHybridTimeLimitsProvider = std::function<CompactionHybridTimeConstraints(
     const std::vector<rocksdb::FileMetaData*>&)>;
+
+// Fills the input range of `result` (input_min / input_max) from the frontiers of `inputs`. An
+// input without frontiers (a file imported by bulk load) widens the range to everything.
+void SetCompactionInputHybridTimeRange(
+    const std::vector<rocksdb::FileMetaData*>& inputs, CompactionHybridTimeConstraints* result);
+
+// Computes the constraints for compacting `inputs` of `db`: the input range from the inputs, then
+// the "other" ranges in the order a write travels through a tablet: the running-transactions
+// floor (`min_running_txn_ht`, present when the tablet has a transaction participant), the
+// memtable frontiers, and every live file that is not an input. `log_prefix` is prepended to
+// diagnostics.
+CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
+    rocksdb::DB& db, const std::vector<rocksdb::FileMetaData*>& inputs,
+    std::optional<HybridTime> min_running_txn_ht, const std::string& log_prefix);
 
 // Counters for column tombstones that compaction could not merge into the packed row they
 // shadow. See DocDBCompactionFeed::Feed for why such a tombstone is kept rather than
