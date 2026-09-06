@@ -86,6 +86,14 @@ YB_DEFINE_ENUM(BlockType, (kData)(kIndex));
 // can type their signatures against it.
 struct FilterBlockCache;
 
+// Lets code outside block_based_table_reader.cc own a FilterBlockCache, e.g. a sequence of
+// probes against one file that reuses the resolved filter block between probes.
+struct FilterBlockCacheDeleter {
+  void operator()(FilterBlockCache* cache) const;
+};
+using FilterBlockCachePtr = std::unique_ptr<FilterBlockCache, FilterBlockCacheDeleter>;
+FilterBlockCachePtr NewFilterBlockCache();
+
 // BloomFilterAwareFileFilter should only be used when scanning within the same hashed components of
 // the key and it should be used together with DocDbAwareFilterPolicy which only takes into account
 // hashed components of key for filtering.

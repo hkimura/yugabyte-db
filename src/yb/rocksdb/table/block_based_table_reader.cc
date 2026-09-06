@@ -345,6 +345,14 @@ struct FilterBlockCache {
   }
 };
 
+void FilterBlockCacheDeleter::operator()(FilterBlockCache* cache) const {
+  delete cache;
+}
+
+FilterBlockCachePtr NewFilterBlockCache() {
+  return FilterBlockCachePtr(new FilterBlockCache());
+}
+
 // BlockEntryIteratorState is used by TwoLevelIterator and MultiLevelIterator in order to check if
 // key prefix may match the filter of the SST file or to create a secondary iterator.
 class BlockBasedTable::BlockEntryIteratorState : public TwoLevelBlockIteratorState {

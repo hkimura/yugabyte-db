@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "yb/rocksdb/rocksdb_fwd.h"
@@ -62,11 +64,26 @@ class CompactionContext {
   virtual ~CompactionContext() = default;
 };
 
+// Asks one live SST file that is not an input of the current compaction whether it may contain
+// any entry with a given user key, through the file's bloom filter (the primitive the read path
+// uses to skip files). The answer is one-sided: false means the key is definitely absent.
+class FileKeyProber {
+ public:
+  virtual ~FileKeyProber() = default;
+  virtual bool MayContainUserKey(Slice user_key) = 0;
+};
+
+using FileKeyProberFactory = std::function<std::unique_ptr<FileKeyProber>(const FileMetaData&)>;
+
 struct CompactionContextOptions {
   // In YugabyteDB we use only level0, so for code simplicity pass level0 inputs only.
   const std::vector<FileMetaData*>& level0_inputs;
   BoundaryValuesExtractor* boundary_extractor;
   CompactionReason compaction_reason;
+  // Level-0 files of the version the compaction pinned that are not its inputs, and a factory for
+  // bloom probes over them. Empty and null when the compaction has no pinned version.
+  std::vector<FileMetaData*> level0_other_files;
+  FileKeyProberFactory new_file_key_prober;
 };
 
 }  // namespace rocksdb

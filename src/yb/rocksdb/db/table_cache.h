@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "yb/rocksdb/cache.h"
+#include "yb/rocksdb/db/compaction_context.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/metadata.h"
@@ -131,6 +132,12 @@ class TableCache {
       const EnvOptions& toptions, const InternalKeyComparatorPtr& internal_comparator,
       const FileDescriptor& fd, QueryId query_id, bool no_io, HistogramImpl* file_read_hist,
       bool skip_filters, Statistics* statistics = nullptr);
+
+  // Returns a bloom-filter prober over the given file (see FileKeyProber), holding the table
+  // reader for the prober's lifetime. Null when the table cannot be opened.
+  std::unique_ptr<FileKeyProber> NewFileKeyProber(
+      const EnvOptions& toptions, const InternalKeyComparatorPtr& internal_comparator,
+      const FileDescriptor& fd, Statistics* statistics);
 
   // Find table reader
   // @param skip_filters Disables loading/accessing the filter block

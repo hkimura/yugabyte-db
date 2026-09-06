@@ -260,6 +260,9 @@ class Compaction {
 
   void SetInputVersion(Version* input_version);
 
+  // The version this compaction pinned its inputs from; null until SetInputVersion.
+  Version* input_version() const { return input_version_; }
+
   struct InputLevelSummaryBuffer {
     char buffer[128];
   };

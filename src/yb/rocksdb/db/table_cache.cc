@@ -26,8 +26,10 @@
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/version_edit.h"
+#include "yb/rocksdb/filter_policy.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/table.h"
+#include "yb/rocksdb/table/block_based_table_reader.h"
 #include "yb/rocksdb/table/get_context.h"
 #include "yb/rocksdb/table/internal_iterator.h"
 #include "yb/rocksdb/table/iterator_wrapper.h"
@@ -475,6 +477,49 @@ yb::Result<TableCache::TableReaderWithHandle> TableCache::GetTableReader(
     trwh.cache = cache_;
   }
   return trwh;
+}
+
+namespace {
+
+// FileKeyProber over a table reader held for the prober's lifetime, reusing one filter block
+// cache across probes so a sorted sequence of keys resolves the filter block about once.
+class TableReaderKeyProber : public FileKeyProber {
+ public:
+  TableReaderKeyProber(TableCache::TableReaderWithHandle&& reader, Statistics* statistics)
+      : reader_(std::move(reader)), filter_block_cache_(NewFilterBlockCache()) {
+    query_options_.query_id = kDefaultQueryId;
+    query_options_.no_io = false;
+    query_options_.statistics = statistics;
+  }
+
+  bool MayContainUserKey(Slice user_key) override {
+    FilterKeyCache filter_key_cache(user_key);
+    return filter_.Filter(
+        query_options_, user_key, &filter_key_cache, filter_block_cache_.get(),
+        reader_.table_reader);
+  }
+
+ private:
+  TableCache::TableReaderWithHandle reader_;
+  FilterBlockCachePtr filter_block_cache_;
+  BloomFilterAwareFileFilter filter_;
+  QueryOptions query_options_;
+};
+
+}  // namespace
+
+std::unique_ptr<FileKeyProber> TableCache::NewFileKeyProber(
+    const EnvOptions& toptions, const InternalKeyComparatorPtr& internal_comparator,
+    const FileDescriptor& fd, Statistics* statistics) {
+  auto reader = GetTableReader(
+      toptions, internal_comparator, fd, kDefaultQueryId, /* no_io= */ false,
+      /* file_read_hist= */ nullptr, /* skip_filters= */ false, statistics);
+  if (!reader.ok()) {
+    LOG(WARNING) << "Cannot open file " << fd.GetNumber() << " for a key probe: "
+                 << reader.status();
+    return nullptr;
+  }
+  return std::make_unique<TableReaderKeyProber>(std::move(*reader), statistics);
 }
 
 Status TableCache::GetTableProperties(
