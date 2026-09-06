@@ -80,6 +80,12 @@ DEFINE_NON_RUNTIME_int32(reclamation_bench_point_reads, 200,
     "Point reads of live ids and of deleted ids issued after each arm.");
 DEFINE_NON_RUNTIME_string(reclamation_bench_csv, "",
     "If set, one row per arm is appended to this CSV file.");
+DEFINE_NON_RUNTIME_int32(reclamation_bench_steady_waves, -1,
+    "Waves in the steady-state case. -1 = reclamation_bench_waves.");
+DEFINE_NON_RUNTIME_int32(reclamation_bench_full_every, 4,
+    "Steady-state case: the periodic full compaction policy compacts every N waves.");
+DEFINE_NON_RUNTIME_string(reclamation_bench_steady_csv, "",
+    "If set, the steady-state case appends one row per policy and wave to this CSV file.");
 DEFINE_NON_RUNTIME_int64(reclamation_bench_seed, 20260906, "Seed for the payload generator.");
 
 namespace yb::docdb {
@@ -603,6 +609,169 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     return result;
   }
 
+  // ---- steady state ---------------------------------------------------------------------------
+
+  // Compaction policy applied after every wave in the steady-state case.
+  enum class Policy { kNone, kFullPeriodic, kReclaim, kReclaimDrop };
+
+  static const char* PolicyName(Policy policy) {
+    switch (policy) {
+      case Policy::kNone: return "NONE";
+      case Policy::kFullPeriodic: return "FULL_PERIODIC";
+      case Policy::kReclaim: return "RECLAIM";
+      case Policy::kReclaimDrop: return "RECLAIM_DROP";
+    }
+    return "?";
+  }
+
+  struct WaveSample {
+    int wave = 0;
+    FileState state;
+    uint64_t cumulative_compact_write_bytes = 0;
+    size_t cumulative_compactions = 0;
+    int64_t cumulative_wall_micros = 0;
+  };
+
+  struct SteadyResult {
+    Policy policy = Policy::kNone;
+    std::vector<WaveSample> samples;
+    ScanResult final_scan;
+  };
+
+  // Cold rows once, then `waves` churn waves (insert, delete a fraction in the same file, flush).
+  // After each wave the history cutoff moves past everything written so far, as if the files had
+  // aged past retention, and the policy runs: FULL_PERIODIC compacts every live file every
+  // `full_every` waves; RECLAIM and RECLAIM_DROP compact the files of the last `group_files`
+  // waves once that many have accumulated. One sample per wave.
+  Result<SteadyResult> RunSteadyState(Policy policy) {
+    RETURN_NOT_OK(ResetDb());
+    SteadyResult result;
+    result.policy = policy;
+
+    const int64_t cold_rows = FLAGS_reclamation_bench_cold_rows >= 0
+        ? FLAGS_reclamation_bench_cold_rows : kDefaultColdRows;
+    const int64_t wave_rows = FLAGS_reclamation_bench_wave_rows >= 0
+        ? FLAGS_reclamation_bench_wave_rows : kDefaultWaveRows;
+    const int cold_files = std::max(1, FLAGS_reclamation_bench_cold_files);
+    const int waves = FLAGS_reclamation_bench_steady_waves >= 0
+        ? FLAGS_reclamation_bench_steady_waves : std::max(1, FLAGS_reclamation_bench_waves);
+    const int full_every = std::max(1, FLAGS_reclamation_bench_full_every);
+    const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
+    const double delete_fraction = std::clamp(FLAGS_reclamation_bench_delete_fraction, 0.0, 1.0);
+
+    cold_rows_ = cold_rows;
+    int64_t next_id = 0;
+    for (int file = 0; file < cold_files && cold_rows > 0; ++file) {
+      const int64_t rows = cold_rows / cold_files + (file < cold_rows % cold_files ? 1 : 0);
+      if (rows == 0) {
+        continue;
+      }
+      for (int64_t i = 0; i < rows; ++i) {
+        RETURN_NOT_OK(InsertRow(next_id++));
+      }
+      RETURN_NOT_OK(FlushToNewFile());
+    }
+
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) =
+        policy == Policy::kReclaimDrop;
+    const auto tickers_start = ReadTickers();
+    std::vector<uint64_t> pending_files;
+    for (int wave = 0; wave < waves; ++wave) {
+      const int64_t first_id = next_id;
+      for (int64_t i = 0; i < wave_rows; ++i) {
+        RETURN_NOT_OK(InsertRow(next_id++));
+      }
+      const auto num_deleted = static_cast<int64_t>(wave_rows * delete_fraction);
+      for (int64_t id = first_id; id < first_id + num_deleted; ++id) {
+        RETURN_NOT_OK(DeleteRow(id));
+      }
+      pending_files.push_back(VERIFY_RESULT(FlushToNewFile()));
+
+      SetHistoryCutoffHybridTime(NextHybridTime());
+      const auto wall_before = MonoTime::Now();
+      size_t compactions = 0;
+      switch (policy) {
+        case Policy::kNone:
+          break;
+        case Policy::kFullPeriodic:
+          if ((wave + 1) % full_every == 0) {
+            RETURN_NOT_OK(CompactFileNumbers(LiveFileNumbers()));
+            ++compactions;
+            pending_files.clear();
+          }
+          break;
+        case Policy::kReclaim:
+        case Policy::kReclaimDrop:
+          if (pending_files.size() >= group) {
+            RETURN_NOT_OK(CompactFileNumbers(pending_files));
+            ++compactions;
+            pending_files.clear();
+          }
+          break;
+      }
+      const auto wall = (MonoTime::Now() - wall_before).ToMicroseconds();
+      SetHistoryCutoffHybridTime(HybridTime::kMin);
+
+      WaveSample sample;
+      sample.wave = wave + 1;
+      sample.state = VERIFY_RESULT(ReadFileState());
+      sample.cumulative_compact_write_bytes =
+          (ReadTickers() - tickers_start).compact_write_bytes;
+      sample.cumulative_compactions =
+          (result.samples.empty() ? 0 : result.samples.back().cumulative_compactions) +
+          compactions;
+      sample.cumulative_wall_micros =
+          (result.samples.empty() ? 0 : result.samples.back().cumulative_wall_micros) + wall;
+      result.samples.push_back(sample);
+    }
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) = false;
+    result.final_scan = VERIFY_RESULT(ScanQueueBuckets());
+
+    const auto& last = result.samples.back();
+    LOG(INFO) << "steady policy=" << PolicyName(policy) << " waves=" << waves
+              << " cold_rows=" << cold_rows << " wave_rows=" << wave_rows
+              << " cumulative_compactions=" << last.cumulative_compactions
+              << " cumulative_compact_write_bytes=" << last.cumulative_compact_write_bytes
+              << " cumulative_wall_ms=" << last.cumulative_wall_micros / 1000
+              << " final_files=" << last.state.num_files
+              << " final_bytes=" << last.state.total_bytes
+              << " final_entries=" << last.state.num_entries
+              << " final_scan_entries_visited=" << result.final_scan.entries_visited;
+    return result;
+  }
+
+  void AppendSteadyCsv(const std::vector<SteadyResult>& results) {
+    if (FLAGS_reclamation_bench_steady_csv.empty()) {
+      return;
+    }
+    std::ifstream probe(FLAGS_reclamation_bench_steady_csv);
+    const bool need_header = !probe.good() || probe.peek() == std::ifstream::traits_type::eof();
+    probe.close();
+    std::ofstream out(FLAGS_reclamation_bench_steady_csv, std::ios::app);
+    ASSERT_TRUE(out.good()) << "Cannot open " << FLAGS_reclamation_bench_steady_csv;
+    if (need_header) {
+      out << "policy,wave,cold_rows,cold_files,wave_rows,delete_fraction,group_files,full_every,"
+             "files,bytes,entries,cumulative_compactions,cumulative_compact_write_bytes,"
+             "cumulative_wall_micros,final_scan_entries_visited\n";
+    }
+    for (const auto& r : results) {
+      for (const auto& s : r.samples) {
+        out << Format(
+            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14\n",
+            PolicyName(r.policy), s.wave,
+            FLAGS_reclamation_bench_cold_rows >= 0 ? FLAGS_reclamation_bench_cold_rows
+                                                   : kDefaultColdRows,
+            FLAGS_reclamation_bench_cold_files,
+            FLAGS_reclamation_bench_wave_rows >= 0 ? FLAGS_reclamation_bench_wave_rows
+                                                   : kDefaultWaveRows,
+            FLAGS_reclamation_bench_delete_fraction, FLAGS_reclamation_bench_group_files,
+            FLAGS_reclamation_bench_full_every, s.state.num_files, s.state.total_bytes,
+            s.state.num_entries, s.cumulative_compactions, s.cumulative_compact_write_bytes,
+            s.cumulative_wall_micros, r.final_scan.entries_visited);
+      }
+    }
+  }
+
   static std::string CsvHeader() {
     return "arm,cold_rows,cold_files,wave_rows,waves,delete_fraction,lag_mode,payload_bytes,"
            "group_files,files_before,bytes_before,entries_before,compactions,wall_micros,"
@@ -740,6 +909,38 @@ TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(QueuePattern)) {
   }
 
   AppendCsv(results);
+}
+
+// Steady state: the same churn under each policy, wave after wave. Cumulative bytes written and
+// the live size over time are the outputs; the sanity checks only pin the ordering that must hold.
+TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(SteadyState)) {
+  InitPayloads();
+  std::vector<SteadyResult> results;
+  for (Policy policy :
+       {Policy::kNone, Policy::kFullPeriodic, Policy::kReclaim, Policy::kReclaimDrop}) {
+    results.push_back(ASSERT_RESULT(RunSteadyState(policy)));
+  }
+
+  const auto& none = results[0].samples.back();
+  const auto& full = results[1].samples.back();
+  const auto& reclaim = results[2].samples.back();
+  const auto& drop = results[3].samples.back();
+  LOG(INFO) << "steady summary: cumulative_compact_write_bytes none/full/reclaim/drop = "
+            << none.cumulative_compact_write_bytes << "/" << full.cumulative_compact_write_bytes
+            << "/" << reclaim.cumulative_compact_write_bytes << "/"
+            << drop.cumulative_compact_write_bytes
+            << ", final_bytes = " << none.state.total_bytes << "/" << full.state.total_bytes
+            << "/" << reclaim.state.total_bytes << "/" << drop.state.total_bytes
+            << ", final_entries = " << none.state.num_entries << "/" << full.state.num_entries
+            << "/" << reclaim.state.num_entries << "/" << drop.state.num_entries;
+
+  ASSERT_EQ(none.cumulative_compact_write_bytes, 0);
+  ASSERT_LE(drop.state.num_entries, reclaim.state.num_entries);
+  if (FLAGS_reclamation_bench_delete_fraction > 0) {
+    ASSERT_LT(reclaim.state.num_entries, none.state.num_entries);
+  }
+
+  AppendSteadyCsv(results);
 }
 
 }  // namespace yb::docdb
