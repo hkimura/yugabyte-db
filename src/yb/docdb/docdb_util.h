@@ -282,8 +282,10 @@ class DocDBRocksDBUtil : public SchemaPackingProvider {
   // Replaces the test stub for compaction hybrid-time constraints (a constant other_min) with the
   // production computation over the memtable and live-file frontiers, so partial compactions in
   // a test decide tombstone removal the way a tablet does. Writes must carry frontiers for that:
-  // set op_id_ to a non-empty value before writing. Re-apply after ReinitDBOptions().
+  // set op_id_ to a non-empty value before writing. Re-apply after ReinitDBOptions(). `metrics`
+  // receives the feed's counters; the overload without it installs none.
   void UseProductionCompactionHybridTimeConstraints();
+  void UseProductionCompactionHybridTimeConstraints(const CompactionMetrics& metrics);
 
   std::atomic<int64_t>& monotonic_counter() {
     return monotonic_counter_;
