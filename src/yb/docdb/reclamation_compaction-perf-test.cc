@@ -60,6 +60,8 @@
 
 using namespace yb::size_literals;
 
+DECLARE_bool(docdb_reclamation_tombstone_drop);
+
 DEFINE_NON_RUNTIME_int64(reclamation_bench_cold_rows, -1,
     "Rows inserted before the churn phase and never deleted. -1 = build-type default.");
 DEFINE_NON_RUNTIME_int32(reclamation_bench_cold_files, 4,
@@ -106,14 +108,17 @@ Result<LagMode> ParseLagMode(const std::string& mode) {
 }
 
 // NONE: no compaction, the baseline. FULL: one CompactFiles over every live file, the incumbent.
-// RECLAIM: CompactFiles over groups of contiguous churn files only.
-enum class Arm { kNone, kFull, kReclaim };
+// RECLAIM: CompactFiles over groups of contiguous churn files only, tombstones governed by the
+// coarse gate. RECLAIM_DROP: the same with docdb_reclamation_tombstone_drop on, so tombstones
+// whose key is proven absent from the files outside the compaction are dropped too.
+enum class Arm { kNone, kFull, kReclaim, kReclaimDrop };
 
 const char* ArmName(Arm arm) {
   switch (arm) {
     case Arm::kNone: return "NONE";
     case Arm::kFull: return "FULL";
     case Arm::kReclaim: return "RECLAIM";
+    case Arm::kReclaimDrop: return "RECLAIM_DROP";
   }
   return "?";
 }
@@ -217,13 +222,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   // partial compactions are governed by the memtable and live-file frontiers as in a tablet.
   // Must be re-applied after any ReinitDBOptions() call, which rebuilds the factory.
   void UseProductionCompactionConstraints() {
-    regular_db_options_.compaction_context_factory = CreateCompactionContextFactory(
-        retention_policy_, &KeyBounds::kNoBounds,
-        [this](const std::vector<rocksdb::FileMetaData*>& inputs) {
-          return ComputeCompactionHybridTimeConstraints(
-              *regular_db_, inputs, /* min_running_txn_ht= */ std::nullopt, "[bench] ");
-        },
-        this, /* vector_metadata_iterator_provider= */ nullptr, CompactionMetrics{});
+    UseProductionCompactionHybridTimeConstraints();
   }
 
   // ---- workload -------------------------------------------------------------------------------
@@ -518,6 +517,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     result.arm = arm;
     result.before = VERIFY_RESULT(ReadFileState());
 
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) =
+        arm == Arm::kReclaimDrop;
     SetHistoryCutoffHybridTime(layout.cutoff);
     const auto tickers_before = ReadTickers();
     const auto cpu_before = ThreadCpuMicros();
@@ -529,7 +530,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
         RETURN_NOT_OK(CompactFileNumbers(LiveFileNumbers()));
         result.compactions = 1;
         break;
-      case Arm::kReclaim: {
+      case Arm::kReclaim:
+      case Arm::kReclaimDrop: {
         // Oracle selection: the generator knows which files carry the churn. Contiguous groups of
         // up to group_files, in creation order.
         const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
@@ -553,6 +555,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     result.cpu_micros = ThreadCpuMicros() - cpu_before;
     result.compaction = ReadTickers() - tickers_before;
     SetHistoryCutoffHybridTime(HybridTime::kMin);
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) = false;
     result.after = VERIFY_RESULT(ReadFileState());
 
     {
@@ -703,30 +706,35 @@ TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompaction) {
   ASSERT_EQ(ASSERT_RESULT(ReadFileState()).num_entries, 2);
 }
 
-// The comparison itself: NONE, FULL and RECLAIM on the flag-defined layout.
+// The comparison itself: NONE, FULL, RECLAIM and RECLAIM_DROP on the flag-defined layout.
 TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(QueuePattern)) {
   InitPayloads();
   std::vector<ArmResult> results;
-  for (Arm arm : {Arm::kNone, Arm::kFull, Arm::kReclaim}) {
+  for (Arm arm : {Arm::kNone, Arm::kFull, Arm::kReclaim, Arm::kReclaimDrop}) {
     results.push_back(ASSERT_RESULT(RunArm(arm)));
   }
 
   const auto& none = results[0];
   const auto& full = results[1];
   const auto& reclaim = results[2];
-  LOG(INFO) << "summary: bytes_after none/full/reclaim = " << none.after.total_bytes << "/"
-            << full.after.total_bytes << "/" << reclaim.after.total_bytes
+  const auto& drop = results[3];
+  LOG(INFO) << "summary: bytes_after none/full/reclaim/drop = " << none.after.total_bytes << "/"
+            << full.after.total_bytes << "/" << reclaim.after.total_bytes << "/"
+            << drop.after.total_bytes
             << ", entries_after = " << none.after.num_entries << "/" << full.after.num_entries
-            << "/" << reclaim.after.num_entries
-            << ", compact_write_bytes full/reclaim = " << full.compaction.compact_write_bytes
-            << "/" << reclaim.compaction.compact_write_bytes
-            << ", scan_entries_visited none/full/reclaim = "
+            << "/" << reclaim.after.num_entries << "/" << drop.after.num_entries
+            << ", compact_write_bytes full/reclaim/drop = " << full.compaction.compact_write_bytes
+            << "/" << reclaim.compaction.compact_write_bytes << "/"
+            << drop.compaction.compact_write_bytes
+            << ", scan_entries_visited none/full/reclaim/drop = "
             << none.scan_result.entries_visited << "/" << full.scan_result.entries_visited << "/"
-            << reclaim.scan_result.entries_visited;
+            << reclaim.scan_result.entries_visited << "/" << drop.scan_result.entries_visited;
 
-  // Sanity, not performance: the full arm removed at least as much as the reclamation arm, and
-  // both reduced the entry count of the baseline whenever something was deleted.
-  ASSERT_LE(full.after.num_entries, reclaim.after.num_entries);
+  // Sanity, not performance: full compaction removes at least as much as either reclamation arm,
+  // dropping tombstones removes at least as much as keeping them, and every compacting arm
+  // reduces the baseline entry count whenever something was deleted.
+  ASSERT_LE(full.after.num_entries, drop.after.num_entries);
+  ASSERT_LE(drop.after.num_entries, reclaim.after.num_entries);
   if (FLAGS_reclamation_bench_delete_fraction > 0) {
     ASSERT_LT(reclaim.after.num_entries, none.after.num_entries);
   }

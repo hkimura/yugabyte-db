@@ -190,6 +190,13 @@ struct CompactionHybridTimeConstraints {
   HybridTime input_max = HybridTime::kMin;
   // Min time of entry that does not participate in compaction.
   HybridTime other_min = HybridTime::kMax;
+  // The same floor split by where the other data lives: live files, whose bloom filters can
+  // prove a key absent, versus the memtable and running transactions, which cannot be probed.
+  // Maintained by HandleOtherFileRange / HandleOtherNonFileRange; floors_split records that both
+  // were populated that way, so a consumer may rely on the split.
+  HybridTime other_min_files = HybridTime::kMax;
+  HybridTime other_min_nonfiles = HybridTime::kMax;
+  bool floors_split = false;
   // Min and max time of entries that could be repacked during this compaction.
   // I.e. we don't have entries that does not participate in compaction within this time interval.
   // Those constraints are exclusive.
@@ -199,6 +206,13 @@ struct CompactionHybridTimeConstraints {
   // input range should be already initialized before calling this function.
   void HandleOtherRange(HybridTime min, HybridTime max);
   void HandleOtherRange(
+      const storage::UserFrontier& smallest, const storage::UserFrontier& largest);
+  // Same as HandleOtherRange, also recording which floor the range belongs to.
+  void HandleOtherFileRange(HybridTime min, HybridTime max);
+  void HandleOtherFileRange(
+      const storage::UserFrontier& smallest, const storage::UserFrontier& largest);
+  void HandleOtherNonFileRange(HybridTime min, HybridTime max);
+  void HandleOtherNonFileRange(
       const storage::UserFrontier& smallest, const storage::UserFrontier& largest);
 
   std::string ToString() const;
@@ -234,6 +248,13 @@ struct CompactionMetrics {
   // case deleted column values are being resurrected and replicas that compact on opposite sides
   // of the flag diverge.
   CounterPtr column_tombstones_dropped_unmerged;
+
+  // Per-key tombstone drop in partial compactions (docdb_reclamation_tombstone_drop): decisions
+  // taken, and the bloom probes they issued.
+  CounterPtr reclamation_tombstones_dropped;
+  CounterPtr reclamation_tombstones_kept_probe_hit;
+  CounterPtr reclamation_tombstones_kept_fail_closed;
+  CounterPtr reclamation_probes;
 };
 
 CompactionMetrics CreateCompactionMetrics(const MetricEntityPtr& tablet_metric_entity);

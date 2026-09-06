@@ -586,6 +586,16 @@ Status DocDBRocksDBUtil::ReinitDBOptions(const TabletId& tablet_id) {
   return ReopenRocksDB();
 }
 
+void DocDBRocksDBUtil::UseProductionCompactionHybridTimeConstraints() {
+  regular_db_options_.compaction_context_factory = CreateCompactionContextFactory(
+      retention_policy_, &KeyBounds::kNoBounds,
+      [this](const std::vector<rocksdb::FileMetaData*>& inputs) {
+        return ComputeCompactionHybridTimeConstraints(
+            *regular_db_, inputs, /* min_running_txn_ht= */ std::nullopt, "[test] ");
+      },
+      this, /* vector_metadata_iterator_provider= */ nullptr, CompactionMetrics{});
+}
+
 DocWriteBatch DocDBRocksDBUtil::MakeDocWriteBatch() {
   return DocWriteBatch(
       DocDB::FromRegularUnbounded(regular_db_.get()), init_marker_behavior_,

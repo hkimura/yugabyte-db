@@ -63,6 +63,41 @@ DEFINE_RUNTIME_bool(docdb_keep_unmerged_column_tombstones_over_packed_row, true,
     "old behavior of garbage-collecting such tombstones, which resurrects deleted column "
     "values.");
 
+DEFINE_RUNTIME_bool(docdb_reclamation_tombstone_drop, false,
+    "In a compaction that does not include every live file, drop a tombstone that is past the "
+    "history cutoff when the bloom filters of the live files outside the compaction prove that no "
+    "older entry for its key exists there. When off, such a tombstone is kept until a compaction "
+    "includes every file that could hold older data.");
+
+DEFINE_RUNTIME_int32(docdb_reclamation_max_probe_files, 64,
+    "Upper bound on the number of live files outside a compaction that per-tombstone bloom probes "
+    "may consult. A compaction with more candidate files keeps its tombstones.");
+
+METRIC_DEFINE_counter(tablet, docdb_reclamation_tombstones_dropped,
+    "Tombstones Dropped by Reclamation Probe",
+    yb::MetricUnit::kKeys,
+    "Number of tombstones a partial compaction dropped because the bloom filters of every live "
+    "file outside the compaction that could hold older data proved the key absent.");
+
+METRIC_DEFINE_counter(tablet, docdb_reclamation_tombstones_kept_probe_hit,
+    "Tombstones Kept by Reclamation Probe Hit",
+    yb::MetricUnit::kKeys,
+    "Number of tombstones a partial compaction kept because the bloom filter of a live file "
+    "outside the compaction may contain the key.");
+
+METRIC_DEFINE_counter(tablet, docdb_reclamation_tombstones_kept_fail_closed,
+    "Tombstones Kept by Reclamation Without Probing",
+    yb::MetricUnit::kKeys,
+    "Number of tombstones a partial compaction kept without probing: the tombstone was not below "
+    "the memtable and running-transaction floor, or its table's schema is missing, or it is a "
+    "vector index metadata key.");
+
+METRIC_DEFINE_counter(tablet, docdb_reclamation_probes,
+    "Reclamation Bloom Probes",
+    yb::MetricUnit::kRequests,
+    "Number of per-file bloom filter probes issued by partial compactions deciding whether a "
+    "tombstone can be dropped.");
+
 METRIC_DEFINE_counter(tablet, docdb_column_tombstones_kept_unmerged,
     "Unmerged Column Tombstones Kept over Packed Row",
     yb::MetricUnit::kKeys,
@@ -84,6 +119,75 @@ METRIC_DEFINE_counter(tablet, docdb_column_tombstones_dropped_unmerged,
 namespace yb::docdb {
 
 using dockv::Expiration;
+
+namespace {
+
+// The live files outside a compaction that could hold an older entry for a key, with a lazily
+// created bloom probe per file. Disabled, so that every answer is "may exist", when the compaction
+// has no pinned version, when an outside file lacks frontiers (an import, whose contents cannot be
+// bounded in time), or when there are more candidate files than docdb_reclamation_max_probe_files.
+class OutsideFileProbeSet {
+ public:
+  OutsideFileProbeSet(
+      const std::vector<rocksdb::FileMetaData*>& files, rocksdb::FileKeyProberFactory factory)
+      : factory_(std::move(factory)) {
+    if (!factory_) {
+      return;
+    }
+    const auto limit = FLAGS_docdb_reclamation_max_probe_files;
+    if (limit < 0 || files.size() > static_cast<size_t>(limit)) {
+      return;
+    }
+    for (auto* file : files) {
+      if (!file->smallest.user_frontier) {
+        entries_.clear();
+        return;
+      }
+      entries_.push_back(Entry {
+        .file = file,
+        .min_ht = down_cast<ConsensusFrontier&>(*file->smallest.user_frontier).hybrid_time(),
+        .prober = nullptr,
+      });
+    }
+    enabled_ = true;
+  }
+
+  bool enabled() const { return enabled_; }
+
+  // Whether an outside file holding entries at or below `ht` may contain `user_key`. A probe that
+  // cannot be made counts as "may contain".
+  bool MayHaveDataAtOrBefore(Slice user_key, HybridTime ht, const CompactionMetrics& metrics) {
+    for (auto& entry : entries_) {
+      if (entry.min_ht > ht) {
+        continue;  // every entry of this file is newer than the tombstone
+      }
+      if (!entry.prober) {
+        entry.prober = factory_(*entry.file);
+        if (!entry.prober) {
+          return true;
+        }
+      }
+      IncrementCounter(metrics.reclamation_probes);
+      if (entry.prober->MayContainUserKey(user_key)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+ private:
+  struct Entry {
+    rocksdb::FileMetaData* file;
+    HybridTime min_ht;
+    std::unique_ptr<rocksdb::FileKeyProber> prober;
+  };
+
+  rocksdb::FileKeyProberFactory factory_;
+  std::vector<Entry> entries_;
+  bool enabled_ = false;
+};
+
+}  // namespace
 using dockv::ValueControlFields;
 
 namespace {
@@ -838,7 +942,9 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
       const KeyBounds* key_bounds,
       SchemaPackingProvider* schema_packing_provider,
       DocVectorMetadataIteratorProvider* vector_metadata_iterator_provider,
-      const CompactionMetrics& metrics)
+      const CompactionMetrics& metrics,
+      const std::vector<rocksdb::FileMetaData*>& outside_files,
+      rocksdb::FileKeyProberFactory prober_factory)
       : next_feed_(*next_feed),
         retention_directive_(retention),
         // Use max write id, to be sure that entries with hybrid time equals to history cutoff
@@ -855,6 +961,15 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
         encoded_repack_max_ht_(hybrid_time_limits.repack_range_max, kMinWriteId),
         could_change_key_range_(!CanHaveOtherDataBefore(
             EncodedDocHybridTime(hybrid_time_limits.input_min, kMinWriteId))),
+        encoded_min_other_nonfile_ht_(
+            hybrid_time_limits.floors_split ? hybrid_time_limits.other_min_nonfiles
+                                            : HybridTime::kMin,
+            kMinWriteId),
+        probe_set_(outside_files, std::move(prober_factory)),
+        probe_drop_enabled_(
+            FLAGS_docdb_reclamation_tombstone_drop && hybrid_time_limits.floors_split &&
+            !retention_directive_.retain_delete_markers_in_major_compaction &&
+            probe_set_.enabled()),
         boundary_extractor_(boundary_extractor),
         packed_row_(this, schema_packing_provider, retention_directive_.history_cutoff),
         vector_metadata_filter_(CreateVectorMetadataFilter(
@@ -966,6 +1081,35 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
     return ht >= encoded_min_other_data_ht_;
   }
 
+  // Per-key relaxation of the file part of CanHaveOtherDataBefore for a tombstone at or below the
+  // history cutoff. The memtable and running-transaction floor stays mandatory, since nothing
+  // there can be probed; the live files outside the compaction that could hold an older entry for
+  // this key are asked through their bloom filters, and the tombstone may go only when every such
+  // probe says absent. Anything else keeps it. This relies on the same assumption the coarse gate
+  // already makes: no regular-DB write with a commit hybrid time below an already-past-cutoff
+  // tombstone arrives later, because everything that could produce one (running transactions,
+  // replication safe times) holds the history cutoff back.
+  Result<bool> CanDropTombstoneByProbe(
+      Slice key, dockv::KeyEntryType key_type, const EncodedDocHybridTime& encoded_doc_ht,
+      LazyHybridTime* lazy_ht) {
+    if (key_type == dockv::KeyEntryType::kVectorIndexMetadata ||
+        packed_row_.active_coprefix_missing_schema() ||
+        encoded_doc_ht >= encoded_min_other_nonfile_ht_) {
+      IncrementCounter(metrics_.reclamation_tombstones_kept_fail_closed);
+      return false;
+    }
+    const auto ht = VERIFY_RESULT(lazy_ht->Get());
+    if (probe_set_.MayHaveDataAtOrBefore(key, ht, metrics_)) {
+      IncrementCounter(metrics_.reclamation_tombstones_kept_probe_hit);
+      return false;
+    }
+    IncrementCounter(metrics_.reclamation_tombstones_dropped);
+    VLOG_WITH_FUNC(3)
+        << "Dropping tombstone, no older data outside the compaction: "
+        << dockv::SubDocKey::DebugSliceToString(key);
+    return true;
+  }
+
   inline Expiration CalcExpiration(
       bool is_ttl_row, const Expiration& popped_exp, MonoDelta ttl,
       LazyHybridTime* doc_ht) {
@@ -1006,6 +1150,11 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
   const EncodedDocHybridTime encoded_repack_min_ht_;
   const EncodedDocHybridTime encoded_repack_max_ht_;
   const bool could_change_key_range_;
+  // Floor below which no memtable entry or running transaction can hold older data; kMin (no
+  // per-key drop possible) unless the constraints came with split floors.
+  const EncodedDocHybridTime encoded_min_other_nonfile_ht_;
+  OutsideFileProbeSet probe_set_;
+  const bool probe_drop_enabled_;
   rocksdb::BoundaryValuesExtractor* boundary_extractor_;
   ValueBuffer new_value_buffer_;
 
@@ -1479,7 +1628,14 @@ Status DocDBCompactionFeed::Feed(const Slice& internal_key, const Slice& value) 
   // or repack is not allowed for this row -- dropping the tombstone would resurrect the
   // pre-delete column value. Keep it; a later compaction that performs the merge collects it.
   bool keeping_unmerged_column_tombstone = false;
-  if (value_type == dockv::ValueEntryType::kTombstone && !CanHaveOtherDataBefore(encoded_doc_ht)) {
+  bool drop_tombstone_by_probe = false;
+  if (value_type == dockv::ValueEntryType::kTombstone && probe_drop_enabled_ &&
+      CanHaveOtherDataBefore(encoded_doc_ht)) {
+    drop_tombstone_by_probe = VERIFY_RESULT(
+        CanDropTombstoneByProbe(key, key_type, encoded_doc_ht, &lazy_ht));
+  }
+  if (value_type == dockv::ValueEntryType::kTombstone &&
+      (!CanHaveOtherDataBefore(encoded_doc_ht) || drop_tombstone_by_probe)) {
     if (!packed_row_.active()) {
       DVLOG_WITH_FUNC(4) << "Skipping due to Tombstoned value and no data before";
       return Status::OK();
@@ -1602,7 +1758,9 @@ class DocDBCompactionContext : public rocksdb::CompactionContext {
       const KeyBounds* key_bounds,
       SchemaPackingProvider* schema_packing_provider,
       DocVectorMetadataIteratorProvider* vector_metadata_iterator_provider,
-      const CompactionMetrics& metrics);
+      const CompactionMetrics& metrics,
+      const std::vector<rocksdb::FileMetaData*>& outside_files,
+      rocksdb::FileKeyProberFactory prober_factory);
 
   ~DocDBCompactionContext() = default;
 
@@ -1651,13 +1809,15 @@ DocDBCompactionContext::DocDBCompactionContext(
     const KeyBounds* key_bounds,
     SchemaPackingProvider* schema_packing_provider,
     DocVectorMetadataIteratorProvider* vector_metadata_iterator_provider,
-    const CompactionMetrics& metrics)
+    const CompactionMetrics& metrics,
+    const std::vector<rocksdb::FileMetaData*>& outside_files,
+    rocksdb::FileKeyProberFactory prober_factory)
     : history_cutoff_(retention.history_cutoff),
       key_bounds_(key_bounds),
       feed_(std::make_unique<DocDBCompactionFeed>(
           compaction_reason, next_feed, std::move(retention), hybrid_time_limits,
           boundary_extractor, key_bounds, schema_packing_provider,
-          vector_metadata_iterator_provider, metrics)) {
+          vector_metadata_iterator_provider, metrics, outside_files, std::move(prober_factory))) {
 }
 
 storage::UserFrontierPtr DocDBCompactionContext::GetLargestUserFrontier() const {
@@ -1744,6 +1904,13 @@ CompactionMetrics CreateCompactionMetrics(const MetricEntityPtr& tablet_metric_e
         METRIC_docdb_column_tombstones_kept_unmerged.Instantiate(tablet_metric_entity),
     .column_tombstones_dropped_unmerged =
         METRIC_docdb_column_tombstones_dropped_unmerged.Instantiate(tablet_metric_entity),
+    .reclamation_tombstones_dropped =
+        METRIC_docdb_reclamation_tombstones_dropped.Instantiate(tablet_metric_entity),
+    .reclamation_tombstones_kept_probe_hit =
+        METRIC_docdb_reclamation_tombstones_kept_probe_hit.Instantiate(tablet_metric_entity),
+    .reclamation_tombstones_kept_fail_closed =
+        METRIC_docdb_reclamation_tombstones_kept_fail_closed.Instantiate(tablet_metric_entity),
+    .reclamation_probes = METRIC_docdb_reclamation_probes.Instantiate(tablet_metric_entity),
   };
 }
 
@@ -1772,7 +1939,9 @@ std::shared_ptr<rocksdb::CompactionContextFactory> CreateCompactionContextFactor
           key_bounds,
           schema_packing_provider,
           vector_metadata_iterator_provider,
-          metrics);
+          metrics,
+          options.level0_other_files,
+          options.new_file_key_prober);
   });
 }
 
@@ -1873,8 +2042,34 @@ void CompactionHybridTimeConstraints::HandleOtherRange(
       down_cast<const docdb::ConsensusFrontier&>(largest).hybrid_time());
 }
 
+void CompactionHybridTimeConstraints::HandleOtherFileRange(HybridTime min, HybridTime max) {
+  HandleOtherRange(min, max);
+  other_min_files = std::min(other_min_files, min);
+}
+
+void CompactionHybridTimeConstraints::HandleOtherFileRange(
+    const storage::UserFrontier& smallest, const storage::UserFrontier& largest) {
+  HandleOtherFileRange(
+      down_cast<const docdb::ConsensusFrontier&>(smallest).hybrid_time(),
+      down_cast<const docdb::ConsensusFrontier&>(largest).hybrid_time());
+}
+
+void CompactionHybridTimeConstraints::HandleOtherNonFileRange(HybridTime min, HybridTime max) {
+  HandleOtherRange(min, max);
+  other_min_nonfiles = std::min(other_min_nonfiles, min);
+}
+
+void CompactionHybridTimeConstraints::HandleOtherNonFileRange(
+    const storage::UserFrontier& smallest, const storage::UserFrontier& largest) {
+  HandleOtherNonFileRange(
+      down_cast<const docdb::ConsensusFrontier&>(smallest).hybrid_time(),
+      down_cast<const docdb::ConsensusFrontier&>(largest).hybrid_time());
+}
+
 std::string CompactionHybridTimeConstraints::ToString() const {
-  return YB_STRUCT_TO_STRING(input_min, input_max, other_min, repack_range_min, repack_range_max);
+  return YB_STRUCT_TO_STRING(
+      input_min, input_max, other_min, other_min_files, other_min_nonfiles, floors_split,
+      repack_range_min, repack_range_max);
 }
 
 void SetCompactionInputHybridTimeRange(
@@ -1906,7 +2101,7 @@ CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
   // our queries. So we follow write record travel order.
   if (min_running_txn_ht) {
     VLOG_WITH_FUNC(4) << log_prefix << "min_running_ht: " << *min_running_txn_ht;
-    result.HandleOtherRange(*min_running_txn_ht, HybridTime::kMax);
+    result.HandleOtherNonFileRange(*min_running_txn_ht, HybridTime::kMax);
   }
 
   auto frontiers = db.GetInMemoryFrontiers();
@@ -1915,7 +2110,7 @@ CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
     VLOG_WITH_FUNC(4)
         << log_prefix << "Mem table frontiers: " << frontiers.smallest->ToString()
         << "-" << frontiers.largest->ToString();
-    result.HandleOtherRange(*frontiers.smallest, *frontiers.largest);
+    result.HandleOtherNonFileRange(*frontiers.smallest, *frontiers.largest);
   }
 
   std::vector<uint64_t> input_names;
@@ -1930,16 +2125,19 @@ CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
       continue;
     }
     if (!file.smallest.user_frontier) {
-      // This should not happen, so disable repacking and delete marker cleanup for safety.
+      // This should not happen, so disable repacking and delete marker cleanup for safety, on
+      // both floors: a file whose contents cannot be bounded in time defeats per-key probing too.
       LOG(DFATAL) << log_prefix << "Other file without frontier: " << file.ToString();
-      result.HandleOtherRange(HybridTime::kMin, HybridTime::kMax);
+      result.HandleOtherFileRange(HybridTime::kMin, HybridTime::kMax);
+      result.HandleOtherNonFileRange(HybridTime::kMin, HybridTime::kMax);
       continue;
     }
     VLOG_WITH_FUNC(4)
         << log_prefix << file.name_id << " frontiers: " << file.smallest.user_frontier->ToString()
         << "-" << file.largest.user_frontier->ToString();
-    result.HandleOtherRange(*file.smallest.user_frontier, *file.largest.user_frontier);
+    result.HandleOtherFileRange(*file.smallest.user_frontier, *file.largest.user_frontier);
   }
+  result.floors_split = true;
 
   VLOG_WITH_FUNC(3) << log_prefix << "Result: " << result.ToString();
   return result;

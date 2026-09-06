@@ -279,6 +279,12 @@ class DocDBRocksDBUtil : public SchemaPackingProvider {
 
   Status ReinitDBOptions(const TabletId& tablet_id);
 
+  // Replaces the test stub for compaction hybrid-time constraints (a constant other_min) with the
+  // production computation over the memtable and live-file frontiers, so partial compactions in
+  // a test decide tombstone removal the way a tablet does. Writes must carry frontiers for that:
+  // set op_id_ to a non-empty value before writing. Re-apply after ReinitDBOptions().
+  void UseProductionCompactionHybridTimeConstraints();
+
   std::atomic<int64_t>& monotonic_counter() {
     return monotonic_counter_;
   }
