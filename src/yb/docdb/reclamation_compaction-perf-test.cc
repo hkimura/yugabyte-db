@@ -29,18 +29,23 @@
 #include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <random>
 
 #include <gtest/gtest.h>
 
 #include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
 
+#include "yb/docdb/doc_read_context.h"
 #include "yb/docdb/docdb_compaction_context.h"
 #include "yb/docdb/docdb_test_base.h"
 #include "yb/docdb/key_bounds.h"
 
 #include "yb/dockv/doc_key.h"
 #include "yb/dockv/doc_path.h"
+#include "yb/dockv/packed_row.h"
+#include "yb/dockv/schema_packing.h"
 #include "yb/dockv/value.h"
 
 #include "yb/rocksdb/db.h"
@@ -97,6 +102,10 @@ DEFINE_NON_RUNTIME_string(reclamation_bench_key_shape, "bucket",
     "scan walks rows in insertion order and the bloom filter key is the bucket. unique: the id "
     "itself is the hashed component, so the bloom filter key is unique per row and the consumer "
     "scan degenerates to a full walk.");
+DEFINE_NON_RUNTIME_string(reclamation_bench_value_format, "column",
+    "column: a row is one column entry under its doc key. packed: a row is one packed-row entry "
+    "at its doc key, the layout YSQL writes, which the compaction feed handles on a separate "
+    "path.");
 
 // The docdb library declares the tablet metric entity and defines counters against it; the
 // prototype itself lives in the tablet library, which this test does not link, so define it here
@@ -129,6 +138,14 @@ Result<LagMode> ParseLagMode(const std::string& mode) {
 }
 
 enum class KeyShape { kBucket, kUnique };
+
+enum class ValueFormat { kColumn, kPacked };
+
+Result<ValueFormat> ParseValueFormat(const std::string& format) {
+  if (format == "column") return ValueFormat::kColumn;
+  if (format == "packed") return ValueFormat::kPacked;
+  return STATUS_FORMAT(InvalidArgument, "Unknown value format: $0", format);
+}
 
 Result<KeyShape> ParseKeyShape(const std::string& shape) {
   if (shape == "bucket") return KeyShape::kBucket;
@@ -256,7 +273,19 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
  protected:
   size_t block_cache_size() const override { return 256_MB; }
 
-  Schema CreateSchema() override { return Schema(); }
+  // The schema only matters for packed rows: its value column is what the row packer encodes and
+  // what the compaction feed's packing provider hands back. Column entries need no schema. The
+  // key columns stand in for either key shape (the packing covers value columns only).
+  Schema CreateSchema() override {
+    if (FLAGS_reclamation_bench_value_format != "packed") {
+      return Schema();
+    }
+    return Schema(
+        {ColumnSchema("h", DataType::INT32, ColumnKind::HASH),
+         ColumnSchema("r", DataType::INT64, ColumnKind::RANGE_ASC_NULL_FIRST),
+         ColumnSchema("v", DataType::STRING, ColumnKind::VALUE, Nullable::kTrue)},
+        {ColumnId(10), ColumnId(11), kValueColumn});
+  }
 
   Status InitRocksDBOptions() override {
     RETURN_NOT_OK(DocDBRocksDBFixture::InitRocksDBOptions());
@@ -347,6 +376,18 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   }
 
   Status InsertRow(int64_t id) {
+    if (value_format_ == ValueFormat::kPacked) {
+      const auto& packing = VERIFY_RESULT_REF(
+          doc_read_context().schema_packing_storage.GetPacking(SchemaVersion(0)));
+      dockv::RowPackerV2 packer(
+          /* version= */ 0, packing, /* packed_size_limit= */ std::numeric_limits<int64_t>::max(),
+          /* control_fields= */ Slice());
+      RETURN_NOT_OK(packer.AddValue(kValueColumn, QLValue::Primitive(Payload(id))));
+      const auto packed_row = VERIFY_RESULT(packer.Complete());
+      return SetPrimitive(
+          dockv::DocPath(EncodedKey(id)), dockv::ValueControlFields(), ValueRef(packed_row),
+          NextHybridTime());
+    }
     return SetPrimitive(
         dockv::DocPath(EncodedKey(id), dockv::KeyEntryValue::MakeColumnId(kValueColumn)),
         QLValue::Primitive(Payload(id)), NextHybridTime());
@@ -686,7 +727,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       result.point_reads_deleted = ReadTickers() - before;
     }
 
-    LOG(INFO) << "arm=" << ArmName(arm)
+    LOG(INFO) << "arm=" << ArmName(arm) << " value_format=" << FLAGS_reclamation_bench_value_format
               << " cold_rows=" << layout.cold_rows << " churn_rows=" << layout.churn_rows
               << " deleted_rows=" << layout.deleted_rows
               << " files_before=" << result.before.num_files
@@ -840,7 +881,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     result.final_scan = VERIFY_RESULT(ScanQueueBuckets());
 
     const auto& last = result.samples.back();
-    LOG(INFO) << "steady policy=" << PolicyName(policy) << " waves=" << waves
+    LOG(INFO) << "steady policy=" << PolicyName(policy)
+              << " value_format=" << FLAGS_reclamation_bench_value_format << " waves=" << waves
               << " cold_rows=" << cold_rows << " wave_rows=" << wave_rows
               << " cumulative_compactions=" << last.cumulative_compactions
               << " cumulative_compact_write_bytes=" << last.cumulative_compact_write_bytes
@@ -864,12 +906,12 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     if (need_header) {
       out << "policy,wave,cold_rows,cold_files,wave_rows,delete_fraction,group_files,full_every,"
              "files,bytes,entries,cumulative_compactions,cumulative_compact_write_bytes,"
-             "cumulative_wall_micros,final_scan_entries_visited\n";
+             "cumulative_wall_micros,final_scan_entries_visited,key_shape,value_format\n";
     }
     for (const auto& r : results) {
       for (const auto& s : r.samples) {
         out << Format(
-            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14\n",
+            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16\n",
             PolicyName(r.policy), s.wave,
             FLAGS_reclamation_bench_cold_rows >= 0 ? FLAGS_reclamation_bench_cold_rows
                                                    : kDefaultColdRows,
@@ -879,7 +921,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             FLAGS_reclamation_bench_delete_fraction, FLAGS_reclamation_bench_group_files,
             FLAGS_reclamation_bench_full_every, s.state.num_files, s.state.total_bytes,
             s.state.num_entries, s.cumulative_compactions, s.cumulative_compact_write_bytes,
-            s.cumulative_wall_micros, r.final_scan.entries_visited);
+            s.cumulative_wall_micros, r.final_scan.entries_visited,
+            FLAGS_reclamation_bench_key_shape, FLAGS_reclamation_bench_value_format);
       }
     }
   }
@@ -893,7 +936,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
            "point_live_bloom_checked,"
            "point_live_bloom_useful,point_deleted_seeks,point_deleted_bloom_checked,"
            "point_deleted_bloom_useful,key_shape,candidate_ratio,probes,tombstones_dropped,"
-           "kept_probe_hit,kept_fail_closed\n";
+           "kept_probe_hit,kept_fail_closed,value_format\n";
   }
 
   static std::string CsvRow(const ArmResult& r) {
@@ -923,10 +966,10 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             r.point_reads_deleted.db_seek, r.point_reads_deleted.bloom_checked,
             r.point_reads_deleted.bloom_useful) +
         Format(
-            "$0,$1,$2,$3,$4,$5\n",
+            "$0,$1,$2,$3,$4,$5,$6\n",
             FLAGS_reclamation_bench_key_shape, FLAGS_reclamation_bench_candidate_ratio,
             r.probe.probes, r.probe.tombstones_dropped, r.probe.kept_probe_hit,
-            r.probe.kept_fail_closed);
+            r.probe.kept_fail_closed, FLAGS_reclamation_bench_value_format);
   }
 
   void AppendCsv(const std::vector<ArmResult>& results) {
@@ -949,10 +992,14 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   void InitPayloads() {
     payload_bytes_ = std::max(1, FLAGS_reclamation_bench_payload_bytes);
     key_shape_ = CHECK_RESULT(ParseKeyShape(FLAGS_reclamation_bench_key_shape));
+    value_format_ = CHECK_RESULT(ParseValueFormat(FLAGS_reclamation_bench_value_format));
   }
+
+  void CheckProductionGateGovernsPartialCompaction();
 
   size_t payload_bytes_ = 1;
   KeyShape key_shape_ = KeyShape::kBucket;
+  ValueFormat value_format_ = ValueFormat::kColumn;
   int64_t next_ht_micros_ = 1000;
   int64_t cold_rows_ = 0;
   MetricRegistry metric_registry_;
@@ -966,7 +1013,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
 // file alone drops the pair, because nothing outside the compaction is older than the tombstone.
 // Layout B (live row in the older file, pair in the newer file): compacting the newer file alone
 // keeps the tombstone, because the older file could hold an earlier version of the same key.
-TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompaction) {
+void ReclamationCompactionPerfTest::CheckProductionGateGovernsPartialCompaction() {
   InitPayloads();
 
   // Layout A.
@@ -996,6 +1043,17 @@ TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompaction) {
   ASSERT_NE(dump.find("DEL"), std::string::npos) << dump;
   // The tombstone survives, the value it shadows does not.
   ASSERT_EQ(ASSERT_RESULT(ReadFileState()).num_entries, 2);
+}
+
+TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompaction) {
+  CheckProductionGateGovernsPartialCompaction();
+}
+
+// The same two layouts with packed rows: the row-level tombstone shadows the packed row inside
+// the compaction exactly as it shadows a column entry.
+TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompactionPackedRows) {
+  FLAGS_reclamation_bench_value_format = "packed";
+  CheckProductionGateGovernsPartialCompaction();
 }
 
 // The comparison itself: NONE, FULL, RECLAIM and RECLAIM_DROP on the flag-defined layout.
