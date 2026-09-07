@@ -134,9 +134,12 @@ Status DBImpl::TEST_WaitForCompact() {
   // TODO: a bug here. This function actually does not necessarily
   // wait for compact. It actually waits for scheduled compaction
   // OR flush to finish.
+  // Compactions running in the priority thread pool are tracked in compaction_tasks_ rather
+  // than bg_compaction_scheduled_, so wait for those too (as CheckBackgroundWorkAndLog does).
 
   InstrumentedMutexLock l(&mutex_);
-  while ((bg_compaction_scheduled_ || bg_flush_scheduled_) && bg_error_.ok()) {
+  while ((bg_compaction_scheduled_ || bg_flush_scheduled_ || !compaction_tasks_.empty()) &&
+         bg_error_.ok()) {
     bg_cv_.Wait();
   }
   return bg_error_;
