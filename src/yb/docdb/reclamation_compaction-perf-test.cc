@@ -141,6 +141,7 @@ namespace {
 constexpr int64_t kDefaultColdRows = RegularBuildVsDebugVsSanitizers(20000, 2000, 500);
 constexpr int64_t kDefaultWaveRows = RegularBuildVsDebugVsSanitizers(5000, 500, 100);
 constexpr uint64_t kIdMixer = 0x9E3779B97F4A7C15ULL;
+constexpr uint64_t kVersionMixer = 0xC2B2AE3D27D4EB4FULL;
 const ColumnId kValueColumn(1);
 
 // Queue-shaped keys: the hash partition is the bucket (id modulo kQueueBuckets) and the id is the
@@ -552,21 +553,24 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
 
   HybridTime NextHybridTime() { return HybridTime::FromMicros(next_ht_micros_++); }
 
-  // A distinct pseudo-random payload per row, so block compression sees no cross-row repeats and
-  // byte counts reflect the payload size rather than a small pool of reused strings.
-  std::string Payload(int64_t id) const {
-    std::mt19937_64 rng(FLAGS_reclamation_bench_seed ^ (static_cast<uint64_t>(id) * kIdMixer));
+  // A distinct pseudo-random payload per row and per version, so block compression sees no
+  // repeats across rows or across the versions of an updated row, and byte counts reflect the
+  // payload size rather than a small pool of reused strings. Version 0 is the insert.
+  std::string Payload(int64_t id, int64_t version) const {
+    std::mt19937_64 rng(
+        FLAGS_reclamation_bench_seed ^ (static_cast<uint64_t>(id) * kIdMixer) ^
+        (static_cast<uint64_t>(version) * kVersionMixer));
     return RandomHumanReadableString(payload_bytes_, &rng);
   }
 
-  Status InsertRow(int64_t id) {
+  Status InsertRow(int64_t id, int64_t version = 0) {
     if (value_format_ == ValueFormat::kPacked) {
       const auto& packing = VERIFY_RESULT_REF(
           doc_read_context().schema_packing_storage.GetPacking(SchemaVersion(0)));
       dockv::RowPackerV2 packer(
           /* version= */ 0, packing, /* packed_size_limit= */ std::numeric_limits<int64_t>::max(),
           /* control_fields= */ Slice());
-      RETURN_NOT_OK(packer.AddValue(kValueColumn, QLValue::Primitive(Payload(id))));
+      RETURN_NOT_OK(packer.AddValue(kValueColumn, QLValue::Primitive(Payload(id, version))));
       const auto packed_row = VERIFY_RESULT(packer.Complete());
       return SetPrimitive(
           dockv::DocPath(EncodedKey(id)), dockv::ValueControlFields(), ValueRef(packed_row),
@@ -574,7 +578,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     }
     return SetPrimitive(
         dockv::DocPath(EncodedKey(id), dockv::KeyEntryValue::MakeColumnId(kValueColumn)),
-        QLValue::Primitive(Payload(id)), NextHybridTime());
+        QLValue::Primitive(Payload(id, version)), NextHybridTime());
   }
 
   Status DeleteRow(int64_t id) {
@@ -711,7 +715,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       for (int wave = 0; wave < waves; ++wave) {
         for (int64_t version = 0; version < updates; ++version) {
           for (int64_t i = 0; i < wave_rows; ++i) {
-            RETURN_NOT_OK(InsertRow(hot_begin + i));
+            RETURN_NOT_OK(InsertRow(hot_begin + i, wave * updates + version));
           }
         }
         layout.churn_files.push_back(VERIFY_RESULT(FlushToNewFile()));
