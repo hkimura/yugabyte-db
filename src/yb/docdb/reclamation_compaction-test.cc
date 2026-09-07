@@ -42,7 +42,9 @@ class ReclamationCompactionTest : public DocDBTestBase {
  public:
   void SetUp() override {
     DocDBTestBase::SetUp();
-    ASSERT_OK(DisableCompactions());
+    if (!KeepUniversalCompactionStyle()) {
+      ASSERT_OK(DisableCompactions());
+    }
     // Writes carry consensus frontiers only while op_id_ is non-empty.
     op_id_.term = 1;
     op_id_.index = 0;
@@ -51,11 +53,19 @@ class ReclamationCompactionTest : public DocDBTestBase {
   }
 
  protected:
+  // DisableCompactions() switches the compaction style to "none", under which a compaction pins
+  // its whole version. Tablets run universal compaction, which pins input files only; the
+  // universal variant below keeps that style and turns the picker off instead.
+  virtual bool KeepUniversalCompactionStyle() const { return false; }
+
   Schema CreateSchema() override { return Schema(); }
 
   Status InitRocksDBOptions() override {
     RETURN_NOT_OK(DocDBRocksDBFixture::InitRocksDBOptions());
     UseProductionCompactionHybridTimeConstraints();
+    if (KeepUniversalCompactionStyle()) {
+      regular_db_options_.disable_auto_compactions = true;
+    }
     return Status::OK();
   }
 
@@ -223,6 +233,38 @@ TEST_F(ReclamationCompactionTest, KeepsPairAboveHistoryCutoff) {
   ASSERT_OK(CompactNewestFile(1500));
   ASSERT_TRUE(DumpHasTombstone()) << DocDBDebugDumpToStr();
   ASSERT_EQ(ASSERT_RESULT(NumEntries()), 3);
+}
+
+class ReclamationCompactionUniversalTest : public ReclamationCompactionTest {
+ protected:
+  bool KeepUniversalCompactionStyle() const override { return true; }
+};
+
+// Under universal compaction the compaction holds no version, only files; the outside files
+// must still be available to probe, or the tombstone would be kept for lack of a probe set.
+TEST_F(ReclamationCompactionUniversalTest, DropsPairWhenNoOlderDataOutside) {
+  ASSERT_OK(Insert(2, 1000));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Insert(1, 2000));
+  ASSERT_OK(DeleteRow(1, 2001));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(CompactNewestFile(3000));
+  ASSERT_FALSE(DumpHasTombstone()) << DocDBDebugDumpToStr();
+  ASSERT_EQ(ASSERT_RESULT(NumEntries()), 1);
+}
+
+// And the probe still sees the older key in the file outside the compaction.
+TEST_F(ReclamationCompactionUniversalTest, KeepsTombstoneWhenOlderFileHasKey) {
+  ASSERT_OK(Insert(1, 1000));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Insert(1, 2000));
+  ASSERT_OK(DeleteRow(1, 2001));
+  ASSERT_OK(Flush());
+
+  ASSERT_OK(CompactNewestFile(3000));
+  ASSERT_TRUE(DumpHasTombstone()) << DocDBDebugDumpToStr();
+  ASSERT_EQ(ASSERT_RESULT(NumEntries()), 2);
 }
 
 }  // namespace yb::docdb

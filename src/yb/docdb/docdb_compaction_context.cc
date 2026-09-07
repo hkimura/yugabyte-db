@@ -132,14 +132,19 @@ class OutsideFileProbeSet {
       const std::vector<rocksdb::FileMetaData*>& files, rocksdb::FileKeyProberFactory factory)
       : factory_(std::move(factory)) {
     if (!factory_) {
+      VLOG(2) << "Reclamation probe set disabled: no pinned version";
       return;
     }
     const auto limit = FLAGS_docdb_reclamation_max_probe_files;
     if (limit < 0 || files.size() > static_cast<size_t>(limit)) {
+      VLOG(2) << "Reclamation probe set disabled: " << files.size() << " outside files, limit "
+              << limit;
       return;
     }
     for (auto* file : files) {
       if (!file->smallest.user_frontier) {
+        VLOG(2) << "Reclamation probe set disabled: outside file without frontier "
+                << file->ToString();
         entries_.clear();
         return;
       }
@@ -150,6 +155,7 @@ class OutsideFileProbeSet {
       });
     }
     enabled_ = true;
+    VLOG(2) << "Reclamation probe set enabled over " << entries_.size() << " outside files";
   }
 
   bool enabled() const { return enabled_; }

@@ -740,20 +740,13 @@ void CompactionJob::ProcessKeyValueCompaction(
           .boundary_extractor = sub_compact->boundary_extractor,
           .compaction_reason = sub_compact->compaction->compaction_reason(),
       };
-      // The files this compaction leaves in place, from the version it pinned, so the context
-      // can ask their bloom filters whether a key still exists outside the inputs.
-      if (auto* input_version = compact_->compaction->input_version()) {
-        const auto& inputs = context.level0_inputs;
-        for (auto* file : input_version->storage_info()->LevelFiles(0)) {
-          if (std::find(inputs.begin(), inputs.end(), file) == inputs.end()) {
-            context.level0_other_files.push_back(file);
-          }
-        }
-        context.new_file_key_prober = [this, cfd](const FileMetaData& file) {
-          return cfd->table_cache()->NewFileKeyProber(
-              env_options_, cfd->internal_comparator(), file.fd, db_options_.statistics.get());
-        };
-      }
+      // The files this compaction leaves in place, held by the compaction for its duration, so
+      // the context can ask their bloom filters whether a key still exists outside the inputs.
+      context.level0_other_files = compact_->compaction->level0_other_files();
+      context.new_file_key_prober = [this, cfd](const FileMetaData& file) {
+        return cfd->table_cache()->NewFileKeyProber(
+            env_options_, cfd->internal_comparator(), file.fd, db_options_.statistics.get());
+      };
       sub_compact->context = (*db_options_.compaction_context_factory)(sub_compact, context);
       sub_compact->feed = sub_compact->context->Feed();
     } else {
