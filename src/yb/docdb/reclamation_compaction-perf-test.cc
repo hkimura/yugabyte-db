@@ -27,11 +27,14 @@
 #include <sys/resource.h>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <random>
 
+#include <boost/container/small_vector.hpp>
 #include <gtest/gtest.h>
 
 #include "yb/common/ql_value.h"
@@ -48,7 +51,12 @@
 #include "yb/dockv/schema_packing.h"
 #include "yb/dockv/value.h"
 
+#include "yb/gutil/casts.h"
+
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/db/db_impl.h"
+#include "yb/rocksdb/db/filename.h"
+#include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/table_properties.h"
 
@@ -106,6 +114,20 @@ DEFINE_NON_RUNTIME_string(reclamation_bench_value_format, "column",
     "column: a row is one column entry under its doc key. packed: a row is one packed-row entry "
     "at its doc key, the layout YSQL writes, which the compaction feed handles on a separate "
     "path.");
+DEFINE_NON_RUNTIME_string(reclamation_bench_selection, "oracle",
+    "oracle: the generator knows which files hold churn and their reclaimable fraction. "
+    "properties: every file carries the reclaimable fraction a statistics collector computes at "
+    "build time (an emulation registered on the fixture), candidates are read from those "
+    "properties as the production trigger will, and contiguous candidates form groups.");
+DEFINE_NON_RUNTIME_bool(reclamation_bench_auto_compactions, false,
+    "Leave the universal compaction picker running while the layout is written, as in a tablet, "
+    "instead of freezing the file layout. Requires --reclamation_bench_selection=properties.");
+DEFINE_NON_RUNTIME_string(reclamation_bench_churn_kind, "delete",
+    "delete: each wave inserts new rows and deletes a fraction of them (the queue pattern). "
+    "update: each wave rewrites the same hot rows --reclamation_bench_updates_per_wave times and "
+    "deletes nothing, so the garbage is superseded versions rather than tombstones.");
+DEFINE_NON_RUNTIME_int32(reclamation_bench_updates_per_wave, 4,
+    "update churn: versions written per hot row per wave.");
 
 // The docdb library declares the tablet metric entity and defines counters against it; the
 // prototype itself lives in the tablet library, which this test does not link, so define it here
@@ -153,6 +175,130 @@ Result<KeyShape> ParseKeyShape(const std::string& shape) {
   return STATUS_FORMAT(InvalidArgument, "Unknown key shape: $0", shape);
 }
 
+enum class Selection { kOracle, kProperties };
+
+Result<Selection> ParseSelection(const std::string& selection) {
+  if (selection == "oracle") return Selection::kOracle;
+  if (selection == "properties") return Selection::kProperties;
+  return STATUS_FORMAT(InvalidArgument, "Unknown selection: $0", selection);
+}
+
+enum class ChurnKind { kDelete, kUpdate };
+
+Result<ChurnKind> ParseChurnKind(const std::string& kind) {
+  if (kind == "delete") return ChurnKind::kDelete;
+  if (kind == "update") return ChurnKind::kUpdate;
+  return STATUS_FORMAT(InvalidArgument, "Unknown churn kind: $0", kind);
+}
+
+// Emulation of the SST statistics collector at file-build time: counts the entries of a file and
+// the subset the collector defines as reclaimable (versions shadowed by a newer entry of the same
+// key inside the file, plus every entry of a row whose newest entry is a tombstone), and stores
+// both as user properties. Selection can then read per-file statistics from any file, including
+// compaction outputs, the way the production trigger will.
+class BenchStatsCollector : public rocksdb::TablePropertiesCollector {
+ public:
+  static constexpr const char* kEntriesProperty = "reclamation_bench.entries";
+  static constexpr const char* kReclaimableProperty = "reclamation_bench.reclaimable";
+
+  Status AddUserKey(
+      const Slice& key, const Slice& value, rocksdb::EntryType, rocksdb::SequenceNumber,
+      uint64_t) override {
+    ++entries_;
+    boost::container::small_vector<size_t, 16> ends;
+    RETURN_NOT_OK(dockv::SubDocKey::DecodeDocKeyAndSubKeyEnds(key, &ends));
+    if (ends.size() < 2) {
+      return Status::OK();  // meta key or unexpected shape: never counted as reclaimable
+    }
+    // ends[1] is the end of the doc key, ends.back() the end of the last subkey (the hybrid time
+    // follows), so the key up to ends.back() identifies the version chain.
+    const Slice doc_key(key.data(), ends[1]);
+    const Slice key_without_ht(key.data(), ends.back());
+    if (doc_key != Slice(current_doc_key_)) {
+      current_doc_key_.assign(doc_key.cdata(), doc_key.size());
+      prev_key_without_ht_.clear();
+      // The first entry of a row is its newest row-level entry when it has one.
+      const bool row_level = ends.size() == 2;
+      const auto tombstoned = dockv::Value::IsTombstoned(value);
+      row_dead_ = row_level && tombstoned.ok() && *tombstoned;
+    }
+    if (row_dead_ || key_without_ht == Slice(prev_key_without_ht_)) {
+      ++reclaimable_;
+    }
+    prev_key_without_ht_.assign(key_without_ht.cdata(), key_without_ht.size());
+    return Status::OK();
+  }
+
+  Status Finish(rocksdb::UserCollectedProperties* properties) override {
+    (*properties)[kEntriesProperty] = std::to_string(entries_);
+    (*properties)[kReclaimableProperty] = std::to_string(reclaimable_);
+    return Status::OK();
+  }
+
+  rocksdb::UserCollectedProperties GetReadableProperties() const override {
+    return {{kEntriesProperty, std::to_string(entries_)},
+            {kReclaimableProperty, std::to_string(reclaimable_)}};
+  }
+
+  const char* Name() const override { return "ReclamationBenchStatsCollector"; }
+
+ private:
+  uint64_t entries_ = 0;
+  uint64_t reclaimable_ = 0;
+  std::string current_doc_key_;
+  std::string prev_key_without_ht_;
+  bool row_dead_ = false;
+};
+
+class BenchStatsCollectorFactory : public rocksdb::TablePropertiesCollectorFactory {
+ public:
+  rocksdb::TablePropertiesCollector* CreateTablePropertiesCollector(
+      rocksdb::TablePropertiesCollectorFactory::Context) override {
+    return new BenchStatsCollector();
+  }
+
+  const char* Name() const override { return "ReclamationBenchStatsCollectorFactory"; }
+};
+
+// Counts the compactions the universal picker runs on its own (CompactFiles does not report
+// through the listener), so their bytes can be told apart from the policy's compactions in the
+// automatic-compaction mode.
+class AutoCompactionCounter : public rocksdb::EventListener {
+ public:
+  struct Snapshot {
+    uint64_t compactions = 0;
+    uint64_t input_bytes = 0;
+    uint64_t output_bytes = 0;
+
+    Snapshot operator-(const Snapshot& rhs) const {
+      return Snapshot {
+        .compactions = compactions - rhs.compactions,
+        .input_bytes = input_bytes - rhs.input_bytes,
+        .output_bytes = output_bytes - rhs.output_bytes,
+      };
+    }
+  };
+
+  void OnCompactionCompleted(rocksdb::DB*, const rocksdb::CompactionJobInfo& info) override {
+    compactions_.fetch_add(1);
+    input_bytes_.fetch_add(info.stats.total_input_bytes);
+    output_bytes_.fetch_add(info.stats.total_output_bytes);
+  }
+
+  Snapshot snapshot() const {
+    return Snapshot {
+      .compactions = compactions_.load(),
+      .input_bytes = input_bytes_.load(),
+      .output_bytes = output_bytes_.load(),
+    };
+  }
+
+ private:
+  std::atomic<uint64_t> compactions_{0};
+  std::atomic<uint64_t> input_bytes_{0};
+  std::atomic<uint64_t> output_bytes_{0};
+};
+
 // Feed counters of the per-key tombstone drop, read from the benchmark's own metric entity.
 struct ProbeCounters {
   int64_t probes = 0;
@@ -174,7 +320,15 @@ struct ProbeCounters {
 // RECLAIM: CompactFiles over groups of contiguous churn files only, tombstones governed by the
 // coarse gate. RECLAIM_DROP: the same with docdb_reclamation_tombstone_drop on, so tombstones
 // whose key is proven absent from the files outside the compaction are dropped too.
-enum class Arm { kNone, kFull, kReclaim, kReclaimDrop };
+// RECLAIM_ANCHORED: RECLAIM_DROP plus, for every group, the file that currently holds the rows
+// the group's tombstones delete (oracle selection only). It emulates a probe-guided extension
+// applied one trigger at a time, and prices the population-2 layouts (far lag, update churn)
+// where the plain arms reclaim nothing. Level-0 compactions are contiguous runs, so each group
+// also takes every file between it and its anchor, including earlier groups' outputs.
+// RECLAIM_RANGE: the same extension batched: one compaction over the run from the oldest anchor
+// of any candidate to the newest candidate, the policy a picker would need to avoid rewriting
+// the growing output once per group.
+enum class Arm { kNone, kFull, kReclaim, kReclaimDrop, kReclaimAnchored, kReclaimRange };
 
 const char* ArmName(Arm arm) {
   switch (arm) {
@@ -182,6 +336,8 @@ const char* ArmName(Arm arm) {
     case Arm::kFull: return "FULL";
     case Arm::kReclaim: return "RECLAIM";
     case Arm::kReclaimDrop: return "RECLAIM_DROP";
+    case Arm::kReclaimAnchored: return "RECLAIM_ANCHORED";
+    case Arm::kReclaimRange: return "RECLAIM_RANGE";
   }
   return "?";
 }
@@ -236,6 +392,11 @@ struct ArmResult {
   int64_t cpu_micros = 0;
   Tickers compaction;
   ProbeCounters probe;
+  // Compactions the universal picker ran on its own: while the layout was written, and while the
+  // policy ran (zero unless --reclamation_bench_auto_compactions).
+  AutoCompactionCounter::Snapshot auto_during_build;
+  AutoCompactionCounter::Snapshot auto_during_policy;
+  size_t cold_files_left = 0;
   // Consumer-style scan: for every queue bucket, seek to it and advance to the first live row.
   ScanResult scan_result;
   Tickers scan;
@@ -257,8 +418,10 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
  public:
   void SetUp() override {
     DocDBTestBase::SetUp();
-    // The generator decides the file layout; no automatic compaction may rearrange it.
-    ASSERT_OK(DisableCompactions());
+    if (!FLAGS_reclamation_bench_auto_compactions) {
+      // The generator decides the file layout; no automatic compaction may rearrange it.
+      ASSERT_OK(DisableCompactions());
+    }
     InitOpId();
   }
 
@@ -290,7 +453,24 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   Status InitRocksDBOptions() override {
     RETURN_NOT_OK(DocDBRocksDBFixture::InitRocksDBOptions());
     UseProductionCompactionConstraints();
+    // Per-file statistics for property-driven selection, and a counter for the picker's own
+    // compactions; both are inert unless the corresponding modes are on.
+    regular_db_options_.table_properties_collector_factories.push_back(
+        std::make_shared<BenchStatsCollectorFactory>());
+    if (!auto_compaction_counter_) {
+      auto_compaction_counter_ = std::make_shared<AutoCompactionCounter>();
+    }
+    regular_db_options_.listeners.push_back(auto_compaction_counter_);
     return Status::OK();
+  }
+
+  // In the automatic-compaction mode, lets the picker finish whatever the last flush or
+  // compaction triggered, so measurements and manual compactions see a settled file set.
+  Status SettleAutoCompactions() {
+    if (!FLAGS_reclamation_bench_auto_compactions) {
+      return Status::OK();
+    }
+    return down_cast<rocksdb::DBImpl*>(regular_db_.get())->TEST_WaitForCompact();
   }
 
   // The fixture's default provider returns a constant for other_min, a test stub that forbids
@@ -327,6 +507,10 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     // Per churn file: reclaimable entries (tombstones plus values shadowed inside the same file)
     // over all entries, the statistic the production trigger will select on.
     std::vector<double> churn_dead_fraction;
+    // Per churn file: indexes (into churn_files) of the files holding the rows this file's
+    // tombstones delete, or the previous versions its updates supersede. Empty when the pair is
+    // inside the file itself.
+    std::vector<std::vector<size_t>> churn_anchors;
     int64_t cold_rows = 0;
     int64_t churn_rows = 0;
     int64_t deleted_rows = 0;
@@ -406,16 +590,80 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     return result;
   }
 
-  // Flushes the memtable and returns the number of the file it produced.
+  // Flushes the memtable and returns the number of the file it produced. In the
+  // automatic-compaction mode the picker may already have merged the new file away, in which case
+  // the newest file that appeared is returned, or 0 when none did.
   Result<uint64_t> FlushToNewFile() {
     auto before = LiveFileNumbers();
     RETURN_NOT_OK(FlushRocksDbAndWait(rocksdb::FlushReason::kTestOnly));
+    RETURN_NOT_OK(SettleAutoCompactions());
     auto after = LiveFileNumbers();
     std::vector<uint64_t> added;
     std::set_difference(
         after.begin(), after.end(), before.begin(), before.end(), std::back_inserter(added));
+    if (FLAGS_reclamation_bench_auto_compactions) {
+      return added.empty() ? 0 : added.back();
+    }
     SCHECK_EQ(added.size(), 1, IllegalState, Format("Flush produced $0 files", added.size()));
     return added.front();
+  }
+
+  struct FileStats {
+    uint64_t number = 0;
+    uint64_t entries = 0;
+    uint64_t reclaimable = 0;
+  };
+
+  // Live files in number order with the collector emulation's counts.
+  Result<std::vector<FileStats>> ReadFileStats() {
+    rocksdb::TablePropertiesCollection props;
+    RETURN_NOT_OK(regular_db_->GetPropertiesOfAllTables(&props));
+    std::vector<FileStats> result;
+    for (const auto& [name, table_props] : props) {
+      FileStats stats;
+      stats.number = rocksdb::TableFileNameToNumber(name);
+      stats.entries = table_props->num_entries;
+      const auto& user = table_props->user_collected_properties;
+      auto it = user.find(BenchStatsCollector::kReclaimableProperty);
+      if (it != user.end()) {
+        stats.reclaimable = std::stoull(it->second);
+      }
+      result.push_back(stats);
+    }
+    std::sort(result.begin(), result.end(), [](const FileStats& a, const FileStats& b) {
+      return a.number < b.number;
+    });
+    return result;
+  }
+
+  // Property-driven selection: groups of up to group_files contiguous candidate files in
+  // file-number order, a candidate being a file whose reclaimable fraction reaches the ratio.
+  // Mirrors the production rule (marked files, adjacent ones batched); unmarked neighbours are
+  // not pulled in, so an insert file next to its delete file is joined only by a normal merge.
+  Result<std::vector<std::vector<uint64_t>>> SelectGroupsByProperties() {
+    const auto stats = VERIFY_RESULT(ReadFileStats());
+    const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
+    std::vector<std::vector<uint64_t>> groups;
+    std::vector<uint64_t> current;
+    for (const auto& s : stats) {
+      const bool candidate = s.entries > 0 &&
+          static_cast<double>(s.reclaimable) / static_cast<double>(s.entries) >=
+              FLAGS_reclamation_bench_candidate_ratio;
+      if (candidate) {
+        current.push_back(s.number);
+        if (current.size() == group) {
+          groups.push_back(current);
+          current.clear();
+        }
+      } else if (!current.empty()) {
+        groups.push_back(current);
+        current.clear();
+      }
+    }
+    if (!current.empty()) {
+      groups.push_back(current);
+    }
+    return groups;
   }
 
   Result<Layout> BuildLayout() {
@@ -452,10 +700,36 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       layout.cold_rows = cold_rows;
     }
 
+    if (churn_kind_ == ChurnKind::kUpdate) {
+      // Update churn: every wave rewrites the same hot rows several times. Within a file the older
+      // versions are shadowed; across files the previous wave's versions are the anchors.
+      const int64_t updates = std::max(1, FLAGS_reclamation_bench_updates_per_wave);
+      const int64_t hot_begin = next_id;
+      for (int64_t i = 0; i < wave_rows && layout.live_ids.size() < sample; ++i) {
+        layout.live_ids.push_back(hot_begin + i);
+      }
+      for (int wave = 0; wave < waves; ++wave) {
+        for (int64_t version = 0; version < updates; ++version) {
+          for (int64_t i = 0; i < wave_rows; ++i) {
+            RETURN_NOT_OK(InsertRow(hot_begin + i));
+          }
+        }
+        layout.churn_files.push_back(VERIFY_RESULT(FlushToNewFile()));
+        layout.churn_dead_fraction.push_back(
+            static_cast<double>(updates - 1) / static_cast<double>(updates));
+        layout.churn_anchors.push_back(
+            wave > 0 ? std::vector<size_t>{static_cast<size_t>(wave - 1)} : std::vector<size_t>{});
+      }
+      layout.churn_rows = wave_rows;
+      layout.cutoff = NextHybridTime();
+      return layout;
+    }
+
     // Churn phase: each wave inserts wave_rows new ids and deletes a fraction of them after the
     // lag the mode prescribes.
     const int far_lag = std::max(1, waves / 2);
     std::vector<std::vector<int64_t>> pending_far_deletes(waves);
+    std::vector<size_t> wave_insert_file(waves, 0);  // churn index holding a wave's inserts
     for (int wave = 0; wave < waves; ++wave) {
       std::vector<int64_t> wave_ids;
       wave_ids.reserve(wave_rows);
@@ -477,10 +751,11 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       }
       layout.deleted_rows += num_deleted;
 
-      auto flush_churn = [&](int64_t dead, int64_t total) -> Status {
+      auto flush_churn = [&](int64_t dead, int64_t total, std::vector<size_t> anchors) -> Status {
         layout.churn_files.push_back(VERIFY_RESULT(FlushToNewFile()));
         layout.churn_dead_fraction.push_back(
             total > 0 ? static_cast<double>(dead) / static_cast<double>(total) : 0.0);
+        layout.churn_anchors.push_back(std::move(anchors));
         return Status::OK();
       };
       switch (lag_mode) {
@@ -489,45 +764,58 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             RETURN_NOT_OK(DeleteRow(id));
           }
           // Each deleted row leaves a tombstone and a shadowed value in this file.
-          RETURN_NOT_OK(flush_churn(2 * num_deleted, wave_rows + num_deleted));
+          wave_insert_file[wave] = layout.churn_files.size();
+          RETURN_NOT_OK(flush_churn(2 * num_deleted, wave_rows + num_deleted, {}));
           break;
         case LagMode::kNextFile:
-          RETURN_NOT_OK(flush_churn(0, wave_rows));
+          wave_insert_file[wave] = layout.churn_files.size();
+          RETURN_NOT_OK(flush_churn(0, wave_rows, {}));
           if (num_deleted > 0) {
             for (int64_t id : to_delete) {
               RETURN_NOT_OK(DeleteRow(id));
             }
-            RETURN_NOT_OK(flush_churn(num_deleted, num_deleted));
+            RETURN_NOT_OK(flush_churn(num_deleted, num_deleted, {wave_insert_file[wave]}));
           }
           break;
         case LagMode::kFar: {
           // This wave's file carries the deletes of the wave `far_lag` waves back.
           int64_t deletes_here = 0;
+          std::vector<size_t> anchors;
           if (wave >= far_lag) {
             for (int64_t id : pending_far_deletes[wave - far_lag]) {
               RETURN_NOT_OK(DeleteRow(id));
               ++deletes_here;
             }
             pending_far_deletes[wave - far_lag].clear();
+            if (deletes_here > 0) {
+              anchors.push_back(wave_insert_file[wave - far_lag]);
+            }
           }
           pending_far_deletes[wave] = std::move(to_delete);
-          RETURN_NOT_OK(flush_churn(deletes_here, wave_rows + deletes_here));
+          wave_insert_file[wave] = layout.churn_files.size();
+          RETURN_NOT_OK(flush_churn(deletes_here, wave_rows + deletes_here, std::move(anchors)));
           break;
         }
       }
     }
     if (lag_mode == LagMode::kFar) {
       int64_t remaining = 0;
-      for (auto& ids : pending_far_deletes) {
-        for (int64_t id : ids) {
+      std::vector<size_t> anchors;
+      for (int wave = 0; wave < waves; ++wave) {
+        if (pending_far_deletes[wave].empty()) {
+          continue;
+        }
+        for (int64_t id : pending_far_deletes[wave]) {
           RETURN_NOT_OK(DeleteRow(id));
           ++remaining;
         }
+        anchors.push_back(wave_insert_file[wave]);
       }
       if (remaining > 0) {
         auto flush_status = [&]() -> Status {
           layout.churn_files.push_back(VERIFY_RESULT(FlushToNewFile()));
           layout.churn_dead_fraction.push_back(1.0);
+          layout.churn_anchors.push_back(std::move(anchors));
           return Status::OK();
         }();
         RETURN_NOT_OK(flush_status);
@@ -595,10 +883,68 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     return names;
   }
 
-  Status CompactFileNumbers(const std::vector<uint64_t>& numbers) {
-    auto names = FileNames(numbers);
-    SCHECK_EQ(names.size(), numbers.size(), IllegalState, "Some files to compact are gone");
-    return regular_db_->CompactFiles(rocksdb::CompactionOptions(), names, /* output_level= */ 0);
+  // Compacts the given files on the calling thread. Returns false when nothing was compacted: in
+  // the automatic-compaction mode a selected file may have been merged away by the picker between
+  // selection and here, or be an input of a compaction in flight; both are skipped.
+  Result<bool> CompactFileNumbers(const std::vector<uint64_t>& numbers) {
+    for (int attempt = 0; ; ++attempt) {
+      RETURN_NOT_OK(SettleAutoCompactions());
+      auto names = FileNames(numbers);
+      if (names.size() != numbers.size()) {
+        SCHECK(FLAGS_reclamation_bench_auto_compactions, IllegalState,
+               "Some files to compact are gone");
+        return false;
+      }
+      auto status = regular_db_->CompactFiles(
+          rocksdb::CompactionOptions(), names, /* output_level= */ 0);
+      if (status.ok()) {
+        return true;
+      }
+      if (!FLAGS_reclamation_bench_auto_compactions || attempt >= 3) {
+        return status;
+      }
+    }
+  }
+
+  // Follows the compactions that consumed a file: the file that now holds its surviving entries,
+  // or 0 when it compacted to nothing.
+  uint64_t CurrentFileOf(uint64_t number, const std::map<uint64_t, uint64_t>& moved) const {
+    while (true) {
+      auto it = moved.find(number);
+      if (it == moved.end()) {
+        return number;
+      }
+      number = it->second;
+      if (number == 0) {
+        return 0;
+      }
+    }
+  }
+
+  // Compacts a group and records where every consumed file went (single output under universal
+  // compaction, or nowhere). Level-0 CompactFiles pulls in every file that sits between the
+  // selected ones in the level's order (rocksdb::CompactionPicker's input sanitizer), so the
+  // consumed set can be larger than the selection: an anchored group is really the whole run of
+  // files from the anchor to the newest selected file.
+  Result<bool> CompactGroupTracked(
+      const std::vector<uint64_t>& numbers, std::map<uint64_t, uint64_t>* moved) {
+    const auto before = LiveFileNumbers();
+    const bool compacted = VERIFY_RESULT(CompactFileNumbers(numbers));
+    if (!compacted) {
+      return false;
+    }
+    const auto after = LiveFileNumbers();
+    std::vector<uint64_t> added;
+    std::set_difference(
+        after.begin(), after.end(), before.begin(), before.end(), std::back_inserter(added));
+    std::vector<uint64_t> consumed;
+    std::set_difference(
+        before.begin(), before.end(), after.begin(), after.end(), std::back_inserter(consumed));
+    const uint64_t output = added.empty() ? 0 : added.back();
+    for (uint64_t number : consumed) {
+      (*moved)[number] = output;
+    }
+    return true;
   }
 
   // The consumer read: for every queue bucket, seek to the bucket and walk forward until the first
@@ -649,15 +995,104 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     return iter->status();
   }
 
+  // Oracle selection: contiguous groups of up to group_files churn files in creation order, each
+  // group containing at least one candidate. With `anchored`, the files holding the rows a group's
+  // tombstones delete join the group (followed through earlier compactions).
+  Result<size_t> RunOracleGroups(const Layout& layout, bool anchored) {
+    const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
+    std::map<uint64_t, uint64_t> moved;
+    size_t compactions = 0;
+    for (size_t i = 0; i < layout.churn_files.size(); i += group) {
+      const size_t end = std::min(i + group, layout.churn_files.size());
+      bool has_candidate = false;
+      for (size_t j = i; j < end; ++j) {
+        has_candidate = has_candidate ||
+            layout.churn_dead_fraction[j] >= FLAGS_reclamation_bench_candidate_ratio;
+      }
+      if (!has_candidate) {
+        continue;  // the trigger would not fire on any file of this group
+      }
+      std::vector<uint64_t> numbers;
+      for (size_t j = i; j < end; ++j) {
+        const auto current = CurrentFileOf(layout.churn_files[j], moved);
+        if (current != 0 && std::find(numbers.begin(), numbers.end(), current) == numbers.end()) {
+          numbers.push_back(current);
+        }
+      }
+      if (anchored) {
+        for (size_t j = i; j < end; ++j) {
+          for (size_t anchor : layout.churn_anchors[j]) {
+            const auto current = CurrentFileOf(layout.churn_files[anchor], moved);
+            if (current != 0 &&
+                std::find(numbers.begin(), numbers.end(), current) == numbers.end()) {
+              numbers.push_back(current);
+            }
+          }
+        }
+      }
+      if (numbers.empty()) {
+        continue;
+      }
+      if (VERIFY_RESULT(CompactGroupTracked(numbers, &moved))) {
+        ++compactions;
+      }
+    }
+    return compactions;
+  }
+
+  // One compaction over every candidate group and its anchors; the level-0 sanitizer fills the
+  // run in between.
+  Result<size_t> RunOracleRange(const Layout& layout) {
+    const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
+    std::vector<uint64_t> numbers;
+    for (size_t i = 0; i < layout.churn_files.size(); i += group) {
+      const size_t end = std::min(i + group, layout.churn_files.size());
+      bool has_candidate = false;
+      for (size_t j = i; j < end; ++j) {
+        has_candidate = has_candidate ||
+            layout.churn_dead_fraction[j] >= FLAGS_reclamation_bench_candidate_ratio;
+      }
+      if (!has_candidate) {
+        continue;
+      }
+      for (size_t j = i; j < end; ++j) {
+        numbers.push_back(layout.churn_files[j]);
+        for (size_t anchor : layout.churn_anchors[j]) {
+          numbers.push_back(layout.churn_files[anchor]);
+        }
+      }
+    }
+    std::sort(numbers.begin(), numbers.end());
+    numbers.erase(std::unique(numbers.begin(), numbers.end()), numbers.end());
+    if (numbers.empty()) {
+      return 0;
+    }
+    return VERIFY_RESULT(CompactFileNumbers(numbers)) ? 1 : 0;
+  }
+
+  Result<size_t> RunPropertyGroups() {
+    size_t compactions = 0;
+    for (const auto& numbers : VERIFY_RESULT(SelectGroupsByProperties())) {
+      if (VERIFY_RESULT(CompactFileNumbers(numbers))) {
+        ++compactions;
+      }
+    }
+    return compactions;
+  }
+
   Result<ArmResult> RunArm(Arm arm) {
     RETURN_NOT_OK(ResetDb());
+    const auto auto_at_start = auto_compaction_counter_->snapshot();
     const auto layout = VERIFY_RESULT(BuildLayout());
+    RETURN_NOT_OK(SettleAutoCompactions());
     ArmResult result;
     result.arm = arm;
     result.before = VERIFY_RESULT(ReadFileState());
+    const auto auto_after_build = auto_compaction_counter_->snapshot();
+    result.auto_during_build = auto_after_build - auto_at_start;
 
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) =
-        arm == Arm::kReclaimDrop;
+        arm == Arm::kReclaimDrop || arm == Arm::kReclaimAnchored || arm == Arm::kReclaimRange;
     SetHistoryCutoffHybridTime(layout.cutoff);
     const auto probe_before = ReadProbeCounters();
     const auto tickers_before = ReadTickers();
@@ -667,42 +1102,40 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       case Arm::kNone:
         break;
       case Arm::kFull:
-        RETURN_NOT_OK(CompactFileNumbers(LiveFileNumbers()));
-        result.compactions = 1;
+        if (VERIFY_RESULT(CompactFileNumbers(LiveFileNumbers()))) {
+          result.compactions = 1;
+        }
         break;
       case Arm::kReclaim:
-      case Arm::kReclaimDrop: {
-        // Oracle selection: the generator knows which files carry the churn. Contiguous groups of
-        // up to group_files, in creation order.
-        const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
-        for (size_t i = 0; i < layout.churn_files.size(); i += group) {
-          const size_t end = std::min(i + group, layout.churn_files.size());
-          bool has_candidate = false;
-          for (size_t j = i; j < end; ++j) {
-            has_candidate = has_candidate ||
-                layout.churn_dead_fraction[j] >= FLAGS_reclamation_bench_candidate_ratio;
-          }
-          if (!has_candidate) {
-            continue;  // the trigger would not fire on any file of this group
-          }
-          std::vector<uint64_t> numbers(
-              layout.churn_files.begin() + i, layout.churn_files.begin() + end);
-          RETURN_NOT_OK(CompactFileNumbers(numbers));
-          ++result.compactions;
+      case Arm::kReclaimDrop:
+      case Arm::kReclaimAnchored:
+      case Arm::kReclaimRange: {
+        if (selection_ == Selection::kProperties) {
+          result.compactions = VERIFY_RESULT(RunPropertyGroups());
+        } else if (arm == Arm::kReclaimRange) {
+          result.compactions = VERIFY_RESULT(RunOracleRange(layout));
+        } else {
+          result.compactions =
+              VERIFY_RESULT(RunOracleGroups(layout, arm == Arm::kReclaimAnchored));
         }
-        // Reclamation must never touch a file it did not select.
+        // Reclamation must never touch a file it did not select. With the picker running, cold
+        // files may legitimately have been merged among themselves, so only count them then.
         const auto live = LiveFileNumbers();
         for (uint64_t cold : layout.cold_files) {
-          SCHECK(std::binary_search(live.begin(), live.end(), cold), IllegalState,
+          const bool present = std::binary_search(live.begin(), live.end(), cold);
+          result.cold_files_left += present ? 1 : 0;
+          SCHECK(present || FLAGS_reclamation_bench_auto_compactions, IllegalState,
                  Format("Cold file $0 was rewritten by a reclamation compaction", cold));
         }
         break;
       }
     }
+    RETURN_NOT_OK(SettleAutoCompactions());
     result.wall_micros = (MonoTime::Now() - wall_before).ToMicroseconds();
     result.cpu_micros = ThreadCpuMicros() - cpu_before;
     result.compaction = ReadTickers() - tickers_before;
     result.probe = ReadProbeCounters() - probe_before;
+    result.auto_during_policy = auto_compaction_counter_->snapshot() - auto_after_build;
     SetHistoryCutoffHybridTime(HybridTime::kMin);
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) = false;
     result.after = VERIFY_RESULT(ReadFileState());
@@ -742,6 +1175,11 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
               << " tombstones_dropped=" << result.probe.tombstones_dropped
               << " kept_probe_hit=" << result.probe.kept_probe_hit
               << " kept_fail_closed=" << result.probe.kept_fail_closed
+              << " auto_compactions_build=" << result.auto_during_build.compactions
+              << " auto_write_bytes_build=" << result.auto_during_build.output_bytes
+              << " auto_compactions=" << result.auto_during_policy.compactions
+              << " auto_write_bytes=" << result.auto_during_policy.output_bytes
+              << " cold_files_left=" << result.cold_files_left
               << " files_after=" << result.after.num_files
               << " bytes_after=" << result.after.total_bytes
               << " entries_after=" << result.after.num_entries
@@ -776,6 +1214,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     uint64_t cumulative_compact_write_bytes = 0;
     size_t cumulative_compactions = 0;
     int64_t cumulative_wall_micros = 0;
+    // The picker's own compactions since the churn started (automatic-compaction mode only).
+    AutoCompactionCounter::Snapshot cumulative_auto;
   };
 
   struct SteadyResult {
@@ -818,9 +1258,11 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       RETURN_NOT_OK(FlushToNewFile());
     }
 
+    RETURN_NOT_OK(SettleAutoCompactions());
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) =
         policy == Policy::kReclaimDrop;
     const auto tickers_start = ReadTickers();
+    const auto auto_start = auto_compaction_counter_->snapshot();
     std::vector<uint64_t> pending_files;
     for (int wave = 0; wave < waves; ++wave) {
       const int64_t first_id = next_id;
@@ -831,7 +1273,10 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       for (int64_t id = first_id; id < first_id + num_deleted; ++id) {
         RETURN_NOT_OK(DeleteRow(id));
       }
-      pending_files.push_back(VERIFY_RESULT(FlushToNewFile()));
+      const auto flushed = VERIFY_RESULT(FlushToNewFile());
+      if (flushed != 0) {
+        pending_files.push_back(flushed);
+      }
 
       SetHistoryCutoffHybridTime(NextHybridTime());
       const auto wall_before = MonoTime::Now();
@@ -841,27 +1286,33 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
           break;
         case Policy::kFullPeriodic:
           if ((wave + 1) % full_every == 0) {
-            RETURN_NOT_OK(CompactFileNumbers(LiveFileNumbers()));
-            ++compactions;
+            if (VERIFY_RESULT(CompactFileNumbers(LiveFileNumbers()))) {
+              ++compactions;
+            }
             pending_files.clear();
           }
           break;
         case Policy::kReclaim:
         case Policy::kReclaimDrop:
-          if (pending_files.size() >= group) {
+          if (selection_ == Selection::kProperties) {
+            compactions += VERIFY_RESULT(RunPropertyGroups());
+            pending_files.clear();
+          } else if (pending_files.size() >= group) {
             // Same-file layout: every pending file has the same reclaimable fraction.
             const double dead_fraction = wave_rows + num_deleted > 0
                 ? static_cast<double>(2 * num_deleted) /
                       static_cast<double>(wave_rows + num_deleted)
                 : 0.0;
             if (dead_fraction >= FLAGS_reclamation_bench_candidate_ratio) {
-              RETURN_NOT_OK(CompactFileNumbers(pending_files));
-              ++compactions;
+              if (VERIFY_RESULT(CompactFileNumbers(pending_files))) {
+                ++compactions;
+              }
             }
             pending_files.clear();
           }
           break;
       }
+      RETURN_NOT_OK(SettleAutoCompactions());
       const auto wall = (MonoTime::Now() - wall_before).ToMicroseconds();
       SetHistoryCutoffHybridTime(HybridTime::kMin);
 
@@ -870,6 +1321,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       sample.state = VERIFY_RESULT(ReadFileState());
       sample.cumulative_compact_write_bytes =
           (ReadTickers() - tickers_start).compact_write_bytes;
+      sample.cumulative_auto = auto_compaction_counter_->snapshot() - auto_start;
       sample.cumulative_compactions =
           (result.samples.empty() ? 0 : result.samples.back().cumulative_compactions) +
           compactions;
@@ -887,6 +1339,8 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
               << " cumulative_compactions=" << last.cumulative_compactions
               << " cumulative_compact_write_bytes=" << last.cumulative_compact_write_bytes
               << " cumulative_wall_ms=" << last.cumulative_wall_micros / 1000
+              << " auto_compactions=" << last.cumulative_auto.compactions
+              << " auto_write_bytes=" << last.cumulative_auto.output_bytes
               << " final_files=" << last.state.num_files
               << " final_bytes=" << last.state.total_bytes
               << " final_entries=" << last.state.num_entries
@@ -906,12 +1360,14 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     if (need_header) {
       out << "policy,wave,cold_rows,cold_files,wave_rows,delete_fraction,group_files,full_every,"
              "files,bytes,entries,cumulative_compactions,cumulative_compact_write_bytes,"
-             "cumulative_wall_micros,final_scan_entries_visited,key_shape,value_format\n";
+             "cumulative_wall_micros,final_scan_entries_visited,key_shape,value_format,"
+             "selection,auto_compactions,cumulative_auto_compactions,"
+             "cumulative_auto_write_bytes\n";
     }
     for (const auto& r : results) {
       for (const auto& s : r.samples) {
         out << Format(
-            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16\n",
+            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,",
             PolicyName(r.policy), s.wave,
             FLAGS_reclamation_bench_cold_rows >= 0 ? FLAGS_reclamation_bench_cold_rows
                                                    : kDefaultColdRows,
@@ -922,7 +1378,11 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             FLAGS_reclamation_bench_full_every, s.state.num_files, s.state.total_bytes,
             s.state.num_entries, s.cumulative_compactions, s.cumulative_compact_write_bytes,
             s.cumulative_wall_micros, r.final_scan.entries_visited,
-            FLAGS_reclamation_bench_key_shape, FLAGS_reclamation_bench_value_format);
+            FLAGS_reclamation_bench_key_shape, FLAGS_reclamation_bench_value_format)
+            << Format(
+                   "$0,$1,$2,$3\n",
+                   FLAGS_reclamation_bench_selection, FLAGS_reclamation_bench_auto_compactions,
+                   s.cumulative_auto.compactions, s.cumulative_auto.output_bytes);
       }
     }
   }
@@ -936,7 +1396,9 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
            "point_live_bloom_checked,"
            "point_live_bloom_useful,point_deleted_seeks,point_deleted_bloom_checked,"
            "point_deleted_bloom_useful,key_shape,candidate_ratio,probes,tombstones_dropped,"
-           "kept_probe_hit,kept_fail_closed,value_format\n";
+           "kept_probe_hit,kept_fail_closed,value_format,selection,auto_compactions,churn_kind,"
+           "updates_per_wave,auto_compactions_build,auto_write_bytes_build,"
+           "auto_compactions_policy,auto_write_bytes_policy,cold_files_left\n";
   }
 
   static std::string CsvRow(const ArmResult& r) {
@@ -966,10 +1428,17 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             r.point_reads_deleted.db_seek, r.point_reads_deleted.bloom_checked,
             r.point_reads_deleted.bloom_useful) +
         Format(
-            "$0,$1,$2,$3,$4,$5,$6\n",
+            "$0,$1,$2,$3,$4,$5,$6,",
             FLAGS_reclamation_bench_key_shape, FLAGS_reclamation_bench_candidate_ratio,
             r.probe.probes, r.probe.tombstones_dropped, r.probe.kept_probe_hit,
-            r.probe.kept_fail_closed, FLAGS_reclamation_bench_value_format);
+            r.probe.kept_fail_closed, FLAGS_reclamation_bench_value_format) +
+        Format(
+            "$0,$1,$2,$3,$4,$5,$6,$7,$8\n",
+            FLAGS_reclamation_bench_selection, FLAGS_reclamation_bench_auto_compactions,
+            FLAGS_reclamation_bench_churn_kind, FLAGS_reclamation_bench_updates_per_wave,
+            r.auto_during_build.compactions, r.auto_during_build.output_bytes,
+            r.auto_during_policy.compactions, r.auto_during_policy.output_bytes,
+            r.cold_files_left);
   }
 
   void AppendCsv(const std::vector<ArmResult>& results) {
@@ -993,6 +1462,10 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     payload_bytes_ = std::max(1, FLAGS_reclamation_bench_payload_bytes);
     key_shape_ = CHECK_RESULT(ParseKeyShape(FLAGS_reclamation_bench_key_shape));
     value_format_ = CHECK_RESULT(ParseValueFormat(FLAGS_reclamation_bench_value_format));
+    selection_ = CHECK_RESULT(ParseSelection(FLAGS_reclamation_bench_selection));
+    churn_kind_ = CHECK_RESULT(ParseChurnKind(FLAGS_reclamation_bench_churn_kind));
+    CHECK(!FLAGS_reclamation_bench_auto_compactions || selection_ == Selection::kProperties)
+        << "--reclamation_bench_auto_compactions needs --reclamation_bench_selection=properties";
   }
 
   void CheckProductionGateGovernsPartialCompaction();
@@ -1000,11 +1473,14 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   size_t payload_bytes_ = 1;
   KeyShape key_shape_ = KeyShape::kBucket;
   ValueFormat value_format_ = ValueFormat::kColumn;
+  Selection selection_ = Selection::kOracle;
+  ChurnKind churn_kind_ = ChurnKind::kDelete;
   int64_t next_ht_micros_ = 1000;
   int64_t cold_rows_ = 0;
   MetricRegistry metric_registry_;
   scoped_refptr<MetricEntity> metric_entity_;
   CompactionMetrics compaction_metrics_;
+  std::shared_ptr<AutoCompactionCounter> auto_compaction_counter_;
 };
 
 // Proves the production gate is in effect for partial compactions, which is what makes the
@@ -1024,7 +1500,7 @@ void ReclamationCompactionPerfTest::CheckProductionGateGovernsPartialCompaction(
   const auto newer_live_file = ASSERT_RESULT(FlushToNewFile());
   ASSERT_NE(pair_file, newer_live_file);
   SetHistoryCutoffHybridTime(NextHybridTime());
-  ASSERT_OK(CompactFileNumbers({pair_file}));
+  ASSERT_TRUE(ASSERT_RESULT(CompactFileNumbers({pair_file})));
   auto dump = DocDBDebugDumpToStr();
   ASSERT_EQ(dump.find("DEL"), std::string::npos) << dump;
   ASSERT_EQ(ASSERT_RESULT(ReadFileState()).num_entries, 1);
@@ -1038,7 +1514,7 @@ void ReclamationCompactionPerfTest::CheckProductionGateGovernsPartialCompaction(
   const auto newer_pair_file = ASSERT_RESULT(FlushToNewFile());
   ASSERT_NE(older_live_file, newer_pair_file);
   SetHistoryCutoffHybridTime(NextHybridTime());
-  ASSERT_OK(CompactFileNumbers({newer_pair_file}));
+  ASSERT_TRUE(ASSERT_RESULT(CompactFileNumbers({newer_pair_file})));
   dump = DocDBDebugDumpToStr();
   ASSERT_NE(dump.find("DEL"), std::string::npos) << dump;
   // The tombstone survives, the value it shadows does not.
@@ -1056,11 +1532,17 @@ TEST_F(ReclamationCompactionPerfTest, ProductionGateGovernsPartialCompactionPack
   CheckProductionGateGovernsPartialCompaction();
 }
 
-// The comparison itself: NONE, FULL, RECLAIM and RECLAIM_DROP on the flag-defined layout.
+// The comparison itself: NONE, FULL, RECLAIM and RECLAIM_DROP on the flag-defined layout, plus
+// RECLAIM_ANCHORED when the oracle knows the anchors.
 TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(QueuePattern)) {
   InitPayloads();
+  std::vector<Arm> arms = {Arm::kNone, Arm::kFull, Arm::kReclaim, Arm::kReclaimDrop};
+  if (selection_ == Selection::kOracle) {
+    arms.push_back(Arm::kReclaimAnchored);
+    arms.push_back(Arm::kReclaimRange);
+  }
   std::vector<ArmResult> results;
-  for (Arm arm : {Arm::kNone, Arm::kFull, Arm::kReclaim, Arm::kReclaimDrop}) {
+  for (Arm arm : arms) {
     results.push_back(ASSERT_RESULT(RunArm(arm)));
   }
 
@@ -1079,17 +1561,30 @@ TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(QueuePattern)) {
             << ", scan_entries_visited none/full/reclaim/drop = "
             << none.scan_result.entries_visited << "/" << full.scan_result.entries_visited << "/"
             << reclaim.scan_result.entries_visited << "/" << drop.scan_result.entries_visited;
+  for (size_t i = 4; i < results.size(); ++i) {
+    const auto& extra = results[i];
+    LOG(INFO) << "summary " << ArmName(extra.arm)
+              << ": compact_write_bytes=" << extra.compaction.compact_write_bytes
+              << " compact_read_bytes=" << extra.compaction.compact_read_bytes
+              << " entries_after=" << extra.after.num_entries
+              << " scan_entries_visited=" << extra.scan_result.entries_visited;
+  }
 
   // Sanity, not performance: full compaction removes at least as much as either reclamation arm,
   // dropping tombstones removes at least as much as keeping them, and a reclamation arm never adds
   // entries. Only the same-file layout guarantees that reclamation reclaims something: with a lag
   // the pair may never share a compaction, and then keeping everything is the correct outcome.
+  // With the picker running the arms start from layouts that already differ, so only the FULL
+  // bound is checked there.
   ASSERT_LE(full.after.num_entries, drop.after.num_entries);
-  ASSERT_LE(drop.after.num_entries, reclaim.after.num_entries);
-  ASSERT_LE(reclaim.after.num_entries, none.after.num_entries);
-  if (FLAGS_reclamation_bench_delete_fraction > 0 &&
-      FLAGS_reclamation_bench_lag_mode == "same_file") {
-    ASSERT_LT(reclaim.after.num_entries, none.after.num_entries);
+  if (!FLAGS_reclamation_bench_auto_compactions) {
+    ASSERT_LE(drop.after.num_entries, reclaim.after.num_entries);
+    ASSERT_LE(reclaim.after.num_entries, none.after.num_entries);
+    if (FLAGS_reclamation_bench_delete_fraction > 0 &&
+        FLAGS_reclamation_bench_lag_mode == "same_file" &&
+        FLAGS_reclamation_bench_churn_kind == "delete") {
+      ASSERT_LT(reclaim.after.num_entries, none.after.num_entries);
+    }
   }
 
   AppendCsv(results);
@@ -1118,10 +1613,12 @@ TEST_F(ReclamationCompactionPerfTest, YB_DISABLE_TEST_IN_TSAN(SteadyState)) {
             << ", final_entries = " << none.state.num_entries << "/" << full.state.num_entries
             << "/" << reclaim.state.num_entries << "/" << drop.state.num_entries;
 
-  ASSERT_EQ(none.cumulative_compact_write_bytes, 0);
-  ASSERT_LE(drop.state.num_entries, reclaim.state.num_entries);
-  if (FLAGS_reclamation_bench_delete_fraction > 0) {
-    ASSERT_LT(reclaim.state.num_entries, none.state.num_entries);
+  if (!FLAGS_reclamation_bench_auto_compactions) {
+    ASSERT_EQ(none.cumulative_compact_write_bytes, 0);
+    ASSERT_LE(drop.state.num_entries, reclaim.state.num_entries);
+    if (FLAGS_reclamation_bench_delete_fraction > 0) {
+      ASSERT_LT(reclaim.state.num_entries, none.state.num_entries);
+    }
   }
 
   AppendSteadyCsv(results);
