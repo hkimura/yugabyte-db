@@ -197,6 +197,21 @@ struct CompactionHybridTimeConstraints {
   HybridTime other_min_files = HybridTime::kMax;
   HybridTime other_min_nonfiles = HybridTime::kMax;
   bool floors_split = false;
+  // Whether other_min_nonfiles is a true lower bound on the hybrid time of every entry that is
+  // not yet in a file. The memtable frontier carries the batch hybrid time, and a write applied
+  // with an external hybrid time (xCluster, index backfill) lands below its frontier, so the
+  // floor cannot be trusted while such a write may still be in memory; the running-transaction
+  // hybrid time is unknown until transactions are loaded. False keeps per-key tombstone drops
+  // off; the coarse gate (other_min) is unaffected.
+  bool nonfile_floor_trusted = false;
+  // Latest batch hybrid time at which a write with an external hybrid time was applied (kMin:
+  // never; kMax: at any time). A file whose smallest frontier is above this holds only entries
+  // at or above that frontier (InitFrontiers puts min(batch, commit) there for every other
+  // path), so such a file can be excluded from a probe by its frontier; any other file cannot.
+  HybridTime external_writes_upto_ht = HybridTime::kMax;
+  // The live files outside the compaction as seen when these constraints were computed, so a
+  // consumer holding a file list from an earlier moment can tell whether a file appeared since.
+  std::vector<uint64_t> other_file_numbers = {};
   // Min and max time of entries that could be repacked during this compaction.
   // I.e. we don't have entries that does not participate in compaction within this time interval.
   // Those constraints are exclusive.
@@ -229,11 +244,16 @@ void SetCompactionInputHybridTimeRange(
 // Computes the constraints for compacting `inputs` of `db`: the input range from the inputs, then
 // the "other" ranges in the order a write travels through a tablet: the running-transactions
 // floor (`min_running_txn_ht`, present when the tablet has a transaction participant), the
-// memtable frontiers, and every live file that is not an input. `log_prefix` is prepended to
+// memtable frontiers, and every live file that is not an input. `external_writes_upto_ht` is the
+// latest batch hybrid time at which a write with an external hybrid time was applied (kMin when
+// none ever was, kMax when such writes may arrive at any time, e.g. under xCluster replication):
+// the non-file floor is trusted only when every in-memory batch is newer than that, and when
+// the running-transaction hybrid time, if given, is valid. `log_prefix` is prepended to
 // diagnostics.
 CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
     rocksdb::DB& db, const std::vector<rocksdb::FileMetaData*>& inputs,
-    std::optional<HybridTime> min_running_txn_ht, const std::string& log_prefix);
+    std::optional<HybridTime> min_running_txn_ht, HybridTime external_writes_upto_ht,
+    const std::string& log_prefix);
 
 // Counters for column tombstones that compaction could not merge into the packed row they
 // shadow. See DocDBCompactionFeed::Feed for why such a tombstone is kept rather than
@@ -250,10 +270,14 @@ struct CompactionMetrics {
   CounterPtr column_tombstones_dropped_unmerged;
 
   // Per-key tombstone drop in partial compactions (docdb_reclamation_tombstone_drop): decisions
-  // taken, and the bloom probes they issued.
+  // taken, and the bloom probes they issued. `dropped` counts tombstones actually removed from
+  // the output; `kept_fail_closed` counts per-tombstone refusals to probe; `probes_disabled`
+  // counts compactions that ran with the flag on but could not probe at all, in which case no
+  // per-tombstone counter moves and the coarse gate decides alone.
   CounterPtr reclamation_tombstones_dropped;
   CounterPtr reclamation_tombstones_kept_probe_hit;
   CounterPtr reclamation_tombstones_kept_fail_closed;
+  CounterPtr reclamation_probes_disabled;
   CounterPtr reclamation_probes;
 };
 
@@ -281,11 +305,15 @@ class ManualHistoryRetentionPolicy : public HistoryRetentionPolicy {
 
   void SetTableTTLForTests(MonoDelta ttl);
 
+  // Emulates an index backfill in progress, which asks compactions to retain delete markers.
+  void SetRetainDeleteMarkersForTests(bool retain);
+
  private:
   std::mutex history_cutoff_mutex_;
   HistoryCutoff history_cutoff_ GUARDED_BY(history_cutoff_mutex_)
       = { HybridTime::kInvalid, HybridTime::kMin };
   std::atomic<MonoDelta> table_ttl_{MonoDelta::kMax};
+  std::atomic<bool> retain_delete_markers_{false};
 };
 
 HybridTime GetHistoryCutoffForKey(Slice coprefix, HistoryCutoff cutoff_info);

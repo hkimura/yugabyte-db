@@ -245,7 +245,7 @@ Status DocDBRocksDBUtil::WriteToRocksDB(
   if (!op_id_.empty()) {
     ++op_id_.index;
     set_op_id(op_id_, &frontiers);
-    set_hybrid_time(hybrid_time, &frontiers);
+    set_hybrid_time(frontier_hybrid_time_override_.value_or(hybrid_time), &frontiers);
     rocksdb_write_batch.SetFrontiers(&frontiers);
   }
 
@@ -596,7 +596,8 @@ void DocDBRocksDBUtil::UseProductionCompactionHybridTimeConstraints(
       retention_policy_, &KeyBounds::kNoBounds,
       [this](const std::vector<rocksdb::FileMetaData*>& inputs) {
         return ComputeCompactionHybridTimeConstraints(
-            *regular_db_, inputs, /* min_running_txn_ht= */ std::nullopt, "[test] ");
+            *regular_db_, inputs, /* min_running_txn_ht= */ std::nullopt,
+            external_writes_upto_ht_, "[test] ");
       },
       this, /* vector_metadata_iterator_provider= */ nullptr, metrics);
 }

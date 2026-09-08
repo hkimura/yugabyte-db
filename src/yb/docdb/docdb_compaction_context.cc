@@ -92,6 +92,15 @@ METRIC_DEFINE_counter(tablet, docdb_reclamation_tombstones_kept_fail_closed,
     "the memtable and running-transaction floor, or its table's schema is missing, or it is a "
     "vector index metadata key.");
 
+METRIC_DEFINE_counter(tablet, docdb_reclamation_probes_disabled,
+    "Reclamation Compactions Without Probes",
+    yb::MetricUnit::kRequests,
+    "Number of compactions that ran with docdb_reclamation_tombstone_drop on but could not "
+    "probe: the files outside the compaction were not held, one of them lacks frontiers, there "
+    "are more of them than docdb_reclamation_max_probe_files, a file appeared after the "
+    "compaction was picked, the in-memory floor cannot be trusted, or delete markers are being "
+    "retained. Every tombstone past the cutoff was then kept by the coarse gate alone.");
+
 METRIC_DEFINE_counter(tablet, docdb_reclamation_probes,
     "Reclamation Bloom Probes",
     yb::MetricUnit::kRequests,
@@ -122,17 +131,24 @@ using dockv::Expiration;
 
 namespace {
 
-// The live files outside a compaction that could hold an older entry for a key, with a lazily
-// created bloom probe per file. Disabled, so that every answer is "may exist", when the compaction
-// has no pinned version, when an outside file lacks frontiers (an import, whose contents cannot be
-// bounded in time), or when there are more candidate files than docdb_reclamation_max_probe_files.
+// The live files outside a compaction, with a lazily created bloom probe per file. A file is
+// excluded from a probe by its frontier only when the frontier is a true lower bound on its
+// entries: a write applied with an external hybrid time (xCluster, index backfill) lands below
+// its batch hybrid time, which is what the frontier carries, so a file written at or before the
+// tablet's last such write is always probed. Disabled, so that every answer is "may exist", when
+// the compaction does not hold its outside files (the feature is off or the files were not
+// pinned), when an outside file lacks frontiers (an import, whose contents cannot be bounded at
+// all), when there are more files than docdb_reclamation_max_probe_files, or when a live file
+// exists that the compaction does not hold (flushed between pick and start, so its contents were
+// never considered).
 class OutsideFileProbeSet {
  public:
   OutsideFileProbeSet(
-      const std::vector<rocksdb::FileMetaData*>& files, rocksdb::FileKeyProberFactory factory)
-      : factory_(std::move(factory)) {
+      const std::vector<rocksdb::FileMetaData*>& files, rocksdb::FileKeyProberFactory factory,
+      const std::vector<uint64_t>& live_other_file_numbers, HybridTime external_writes_upto_ht)
+      : factory_(std::move(factory)), external_writes_upto_ht_(external_writes_upto_ht) {
     if (!factory_) {
-      VLOG(2) << "Reclamation probe set disabled: no pinned version";
+      VLOG(2) << "Reclamation probe set disabled: outside files not held";
       return;
     }
     const auto limit = FLAGS_docdb_reclamation_max_probe_files;
@@ -154,17 +170,30 @@ class OutsideFileProbeSet {
         .prober = nullptr,
       });
     }
+    for (uint64_t number : live_other_file_numbers) {
+      const bool held = std::any_of(entries_.begin(), entries_.end(), [number](const Entry& e) {
+        return e.file->fd.GetNumber() == number;
+      });
+      if (!held) {
+        VLOG(2) << "Reclamation probe set disabled: live file " << number
+                << " is not held by the compaction";
+        entries_.clear();
+        return;
+      }
+    }
     enabled_ = true;
     VLOG(2) << "Reclamation probe set enabled over " << entries_.size() << " outside files";
   }
 
   bool enabled() const { return enabled_; }
 
-  // Whether an outside file holding entries at or below `ht` may contain `user_key`. A probe that
-  // cannot be made counts as "may contain".
+  // Whether an outside file may contain `user_key` at or below `ht`. A probe that cannot be made
+  // counts as "may contain". A file is skipped only when its frontier bounds its entries from
+  // below (see the class comment) and that bound is above `ht`.
   bool MayHaveDataAtOrBefore(Slice user_key, HybridTime ht, const CompactionMetrics& metrics) {
     for (auto& entry : entries_) {
-      if (entry.min_ht > ht) {
+      if (entry.min_ht.is_valid() && entry.min_ht > ht &&
+          entry.min_ht > external_writes_upto_ht_) {
         continue;  // every entry of this file is newer than the tombstone
       }
       if (!entry.prober) {
@@ -189,6 +218,7 @@ class OutsideFileProbeSet {
   };
 
   rocksdb::FileKeyProberFactory factory_;
+  const HybridTime external_writes_upto_ht_;
   std::vector<Entry> entries_;
   bool enabled_ = false;
 };
@@ -971,9 +1001,12 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
             hybrid_time_limits.floors_split ? hybrid_time_limits.other_min_nonfiles
                                             : HybridTime::kMin,
             kMinWriteId),
-        probe_set_(outside_files, std::move(prober_factory)),
+        probe_set_(
+            outside_files, std::move(prober_factory), hybrid_time_limits.other_file_numbers,
+            hybrid_time_limits.external_writes_upto_ht),
         probe_drop_enabled_(
             FLAGS_docdb_reclamation_tombstone_drop && hybrid_time_limits.floors_split &&
+            hybrid_time_limits.nonfile_floor_trusted &&
             !retention_directive_.retain_delete_markers_in_major_compaction &&
             probe_set_.enabled()),
         boundary_extractor_(boundary_extractor),
@@ -987,7 +1020,11 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
         << "DocDB compaction feed, min_other_data_ht: " << encoded_min_other_data_ht_.ToString()
         << ", history_cutoff = " << retention_directive_.history_cutoff
         << ", repack range: " << encoded_repack_min_ht_.ToString()
-        << " - " << encoded_repack_max_ht_.ToString();
+        << " - " << encoded_repack_max_ht_.ToString()
+        << ", per-key tombstone drop: " << (probe_drop_enabled_ ? "on" : "off");
+    if (FLAGS_docdb_reclamation_tombstone_drop && !probe_drop_enabled_) {
+      IncrementCounter(metrics_.reclamation_probes_disabled);
+    }
   }
 
   Status Feed(const Slice& internal_key, const Slice& value) override;
@@ -1089,16 +1126,27 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
 
   // Per-key relaxation of the file part of CanHaveOtherDataBefore for a tombstone at or below the
   // history cutoff. The memtable and running-transaction floor stays mandatory, since nothing
-  // there can be probed; the live files outside the compaction that could hold an older entry for
-  // this key are asked through their bloom filters, and the tombstone may go only when every such
-  // probe says absent. Anything else keeps it. This relies on the same assumption the coarse gate
-  // already makes: no regular-DB write with a commit hybrid time below an already-past-cutoff
-  // tombstone arrives later, because everything that could produce one (running transactions,
-  // replication safe times) holds the history cutoff back.
+  // there can be probed; the live files outside the compaction that could hold an older entry
+  // are asked through their bloom filters, and the tombstone may go only when every probe says
+  // absent. Anything else keeps it. The caller counts the drop once the entry is actually removed
+  // from the output; this function counts only the refusals. This relies on the same assumption
+  // the coarse gate already makes: no regular-DB write with a commit hybrid time below an
+  // already-past-cutoff tombstone arrives later, because everything that could produce one
+  // (running transactions, replication safe times) holds the history cutoff back.
   Result<bool> CanDropTombstoneByProbe(
       Slice key, dockv::KeyEntryType key_type, const EncodedDocHybridTime& encoded_doc_ht,
       LazyHybridTime* lazy_ht) {
-    if (key_type == dockv::KeyEntryType::kVectorIndexMetadata ||
+    // A bloom probe answers for the key's own filter key, and every entry of a row shares the
+    // row's filter key. A tombstone whose doc key has neither hash nor range components (a
+    // table-level tombstone: coprefix only, as DecodeDocKeyAndSubKeyEnds marks by leaving a
+    // single end; or an empty doc key) shadows rows whose filter keys differ from its own, so a
+    // miss proves nothing about them.
+    const bool prefix_tombstone =
+        sub_key_ends_.size() == 1 ||
+        (sub_key_ends_[0] < key.size() &&
+         key[sub_key_ends_[0]] == dockv::KeyEntryTypeAsChar::kGroupEnd);
+    if (prefix_tombstone ||
+        key_type == dockv::KeyEntryType::kVectorIndexMetadata ||
         packed_row_.active_coprefix_missing_schema() ||
         encoded_doc_ht >= encoded_min_other_nonfile_ht_) {
       IncrementCounter(metrics_.reclamation_tombstones_kept_fail_closed);
@@ -1109,9 +1157,8 @@ class DocDBCompactionFeed : public rocksdb::CompactionFeed, public PackedRowFeed
       IncrementCounter(metrics_.reclamation_tombstones_kept_probe_hit);
       return false;
     }
-    IncrementCounter(metrics_.reclamation_tombstones_dropped);
     VLOG_WITH_FUNC(3)
-        << "Dropping tombstone, no older data outside the compaction: "
+        << "No older data outside the compaction for tombstone: "
         << dockv::SubDocKey::DebugSliceToString(key);
     return true;
   }
@@ -1644,6 +1691,9 @@ Status DocDBCompactionFeed::Feed(const Slice& internal_key, const Slice& value) 
       (!CanHaveOtherDataBefore(encoded_doc_ht) || drop_tombstone_by_probe)) {
     if (!packed_row_.active()) {
       DVLOG_WITH_FUNC(4) << "Skipping due to Tombstoned value and no data before";
+      if (drop_tombstone_by_probe) {
+        IncrementCounter(metrics_.reclamation_tombstones_dropped);
+      }
       return Status::OK();
     }
     if (!FLAGS_docdb_keep_unmerged_column_tombstones_over_packed_row) {
@@ -1654,6 +1704,9 @@ Status DocDBCompactionFeed::Feed(const Slice& internal_key, const Slice& value) 
         IncrementCounter(metrics_.column_tombstones_dropped_unmerged);
       }
       DVLOG_WITH_FUNC(4) << "Skipping due to Tombstoned value and no data before";
+      if (drop_tombstone_by_probe) {
+        IncrementCounter(metrics_.reclamation_tombstones_dropped);
+      }
       return Status::OK();
     }
     // A tombstone shadows a carried packed row, never the other way around: the packed row put
@@ -1916,6 +1969,8 @@ CompactionMetrics CreateCompactionMetrics(const MetricEntityPtr& tablet_metric_e
         METRIC_docdb_reclamation_tombstones_kept_probe_hit.Instantiate(tablet_metric_entity),
     .reclamation_tombstones_kept_fail_closed =
         METRIC_docdb_reclamation_tombstones_kept_fail_closed.Instantiate(tablet_metric_entity),
+    .reclamation_probes_disabled =
+        METRIC_docdb_reclamation_probes_disabled.Instantiate(tablet_metric_entity),
     .reclamation_probes = METRIC_docdb_reclamation_probes.Instantiate(tablet_metric_entity),
   };
 }
@@ -1958,7 +2013,12 @@ HistoryRetentionDirective ManualHistoryRetentionPolicy::GetRetentionDirective() 
   LOG(INFO) << "Retention directive from manual policy " << history_cutoff_;
   return { history_cutoff_,
           table_ttl_.load(std::memory_order_acquire),
-          ShouldRetainDeleteMarkersInMajorCompaction::kFalse };
+          ShouldRetainDeleteMarkersInMajorCompaction(
+              retain_delete_markers_.load(std::memory_order_acquire)) };
+}
+
+void ManualHistoryRetentionPolicy::SetRetainDeleteMarkersForTests(bool retain) {
+  retain_delete_markers_.store(retain, std::memory_order_release);
 }
 
 // TODO(Sanket): Is this even used anywhere?
@@ -2099,14 +2159,22 @@ void SetCompactionInputHybridTimeRange(
 
 CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
     rocksdb::DB& db, const std::vector<rocksdb::FileMetaData*>& inputs,
-    std::optional<HybridTime> min_running_txn_ht, const std::string& log_prefix) {
+    std::optional<HybridTime> min_running_txn_ht, HybridTime external_writes_upto_ht,
+    const std::string& log_prefix) {
   CompactionHybridTimeConstraints result;
   SetCompactionInputHybridTimeRange(inputs, &result);
+  result.nonfile_floor_trusted = true;
+  result.external_writes_upto_ht = external_writes_upto_ht;
 
   // Query order is important. Since it is not atomic, we should be sure that write would not sneak
   // our queries. So we follow write record travel order.
   if (min_running_txn_ht) {
     VLOG_WITH_FUNC(4) << log_prefix << "min_running_ht: " << *min_running_txn_ht;
+    if (!min_running_txn_ht->is_valid()) {
+      // Transactions are not loaded yet: nothing is known about them, so per-key drops must wait.
+      // The coarse floor is left as it always was.
+      result.nonfile_floor_trusted = false;
+    }
     result.HandleOtherNonFileRange(*min_running_txn_ht, HybridTime::kMax);
   }
 
@@ -2116,6 +2184,12 @@ CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
     VLOG_WITH_FUNC(4)
         << log_prefix << "Mem table frontiers: " << frontiers.smallest->ToString()
         << "-" << frontiers.largest->ToString();
+    const auto memtable_min_ht =
+        down_cast<const ConsensusFrontier&>(*frontiers.smallest).hybrid_time();
+    if (!memtable_min_ht.is_valid() || memtable_min_ht <= external_writes_upto_ht) {
+      // Something in memory may carry an entry below its batch hybrid time.
+      result.nonfile_floor_trusted = false;
+    }
     result.HandleOtherNonFileRange(*frontiers.smallest, *frontiers.largest);
   }
 
@@ -2142,6 +2216,7 @@ CompactionHybridTimeConstraints ComputeCompactionHybridTimeConstraints(
         << log_prefix << file.name_id << " frontiers: " << file.smallest.user_frontier->ToString()
         << "-" << file.largest.user_frontier->ToString();
     result.HandleOtherFileRange(*file.smallest.user_frontier, *file.largest.user_frontier);
+    result.other_file_numbers.push_back(file.name_id);
   }
   result.floors_split = true;
 

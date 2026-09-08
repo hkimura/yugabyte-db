@@ -116,6 +116,7 @@
 #include "yb/util/debug/trace_event.h"
 #include "yb/util/file_util.h"
 #include "yb/util/flag_validators.h"
+#include "yb/util/atomic.h"
 #include "yb/util/flags.h"
 #include "yb/util/format.h"
 #include "yb/util/logging.h"
@@ -2016,6 +2017,11 @@ Status Tablet::ApplyOperation(
   // different from batch_hybrid_time in cases like xcluster and index backfill.
   auto write_hybrid_time = operation.WriteHybridTime();
   auto batch_hybrid_time = operation.hybrid_time();
+  if (write_hybrid_time != batch_hybrid_time) {
+    // Remembered so compactions know how far back in-memory data may carry entries older than
+    // their frontier (see CompactionHybridTimeConstraints).
+    UpdateAtomicMax(&last_external_write_batch_ht_, batch_hybrid_time.ToUint64());
+  }
 
   docdb::ConsensusFrontiers frontiers;
   // Even if we have an external hybrid time, use the local commit hybrid time in the consensus
@@ -5661,8 +5667,14 @@ docdb::CompactionHybridTimeConstraints Tablet::CompactionHybridTimeConstraints(
   if (transaction_participant_) {
     min_running_txn_ht = transaction_participant_->MinRunningHybridTime();
   }
+  // Writes with an external hybrid time (xCluster, index backfill) land below their batch hybrid
+  // time, which is what frontiers carry; per-key tombstone drops may trust the in-memory floor
+  // only once every such write has left memory, and never under xCluster replication.
+  const auto external_writes_upto_ht = metadata_->IsUnderXClusterReplication()
+      ? HybridTime::kMax
+      : HybridTime(last_external_write_batch_ht_.load(std::memory_order_acquire));
   return docdb::ComputeCompactionHybridTimeConstraints(
-      *regular_db_, inputs, min_running_txn_ht, LogPrefix());
+      *regular_db_, inputs, min_running_txn_ht, external_writes_upto_ht, LogPrefix());
 }
 
 Status Tablet::ProcessAutoFlagsConfigOperation(const AutoFlagsConfigPB& config) {

@@ -287,6 +287,16 @@ class DocDBRocksDBUtil : public SchemaPackingProvider {
   void UseProductionCompactionHybridTimeConstraints();
   void UseProductionCompactionHybridTimeConstraints(const CompactionMetrics& metrics);
 
+  // Emulates a tablet whose writes with external hybrid times were applied up to this batch
+  // hybrid time (see ComputeCompactionHybridTimeConstraints). Default: never.
+  void SetExternalWritesUpToForTests(HybridTime ht) { external_writes_upto_ht_ = ht; }
+
+  // Makes subsequent writes carry this frontier hybrid time instead of their own, the way a
+  // write with an external hybrid time lands below its frontier. nullopt restores the default.
+  void SetFrontierHybridTimeOverrideForTests(std::optional<HybridTime> ht) {
+    frontier_hybrid_time_override_ = ht;
+  }
+
   std::atomic<int64_t>& monotonic_counter() {
     return monotonic_counter_;
   }
@@ -327,6 +337,8 @@ class DocDBRocksDBUtil : public SchemaPackingProvider {
   IsolationLevel txn_isolation_level_ = IsolationLevel::NON_TRANSACTIONAL;
   InitMarkerBehavior init_marker_behavior_ = InitMarkerBehavior::kOptional;
   HybridTime delete_marker_retention_time_ = HybridTime::kMax;
+  HybridTime external_writes_upto_ht_ = HybridTime::kMin;
+  std::optional<HybridTime> frontier_hybrid_time_override_;
 
   Result<CompactionSchemaInfo> CotablePacking(
       const Uuid& table_id, uint32_t schema_version, HybridTime history_cutoff) override;

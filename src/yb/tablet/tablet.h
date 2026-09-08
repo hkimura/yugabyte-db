@@ -1369,6 +1369,10 @@ class Tablet : public AbstractTablet,
 
   std::unique_ptr<TransactionParticipant> transaction_participant_;
 
+  // Latest batch hybrid time at which a write with an external hybrid time was applied (kMin if
+  // never). Such entries sit below their frontier; see CompactionHybridTimeConstraints.
+  std::atomic<uint64_t> last_external_write_batch_ht_{HybridTime::kMin.ToUint64()};
+
   std::shared_future<client::YBClient*> client_future_;
 
   // Expected to live while this object is alive.
