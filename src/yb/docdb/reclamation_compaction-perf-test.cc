@@ -32,6 +32,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
 
 #include <boost/container/small_vector.hpp>
@@ -58,6 +59,7 @@
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/statistics.h"
+#include "yb/rocksdb/table/block_based_table_reader.h"
 #include "yb/rocksdb/table_properties.h"
 
 #include "yb/util/flags.h"
@@ -196,7 +198,10 @@ Result<ChurnKind> ParseChurnKind(const std::string& kind) {
 // the subset the collector defines as reclaimable (versions shadowed by a newer entry of the same
 // key inside the file, plus every entry of a row whose newest entry is a tombstone), and stores
 // both as user properties. Selection can then read per-file statistics from any file, including
-// compaction outputs, the way the production trigger will.
+// compaction outputs, the way the production trigger will. A row is taken as dead when its first
+// entry is a row-level tombstone; row-level entries sort before column entries whatever their
+// hybrid times, so a row re-inserted column by column after a row delete would count as dead
+// here. The benchmark layouts never reuse a key, so this does not arise.
 class BenchStatsCollector : public rocksdb::TablePropertiesCollector {
  public:
   static constexpr const char* kEntriesProperty = "reclamation_bench.entries";
@@ -306,6 +311,8 @@ struct ProbeCounters {
   int64_t tombstones_dropped = 0;
   int64_t kept_probe_hit = 0;
   int64_t kept_fail_closed = 0;
+  // Compactions that ran with the drop flag on but could not probe (budget, hold, floor).
+  int64_t probes_disabled = 0;
 
   ProbeCounters operator-(const ProbeCounters& rhs) const {
     return ProbeCounters {
@@ -313,6 +320,7 @@ struct ProbeCounters {
       .tombstones_dropped = tombstones_dropped - rhs.tombstones_dropped,
       .kept_probe_hit = kept_probe_hit - rhs.kept_probe_hit,
       .kept_fail_closed = kept_fail_closed - rhs.kept_fail_closed,
+      .probes_disabled = probes_disabled - rhs.probes_disabled,
     };
   }
 };
@@ -497,6 +505,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
       .tombstones_dropped = compaction_metrics_.reclamation_tombstones_dropped->value(),
       .kept_probe_hit = compaction_metrics_.reclamation_tombstones_kept_probe_hit->value(),
       .kept_fail_closed = compaction_metrics_.reclamation_tombstones_kept_fail_closed->value(),
+      .probes_disabled = compaction_metrics_.reclamation_probes_disabled->value(),
     };
   }
 
@@ -645,7 +654,21 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
   // Mirrors the production rule (marked files, adjacent ones batched); unmarked neighbours are
   // not pulled in, so an insert file next to its delete file is joined only by a normal merge.
   Result<std::vector<std::vector<uint64_t>>> SelectGroupsByProperties() {
-    const auto stats = VERIFY_RESULT(ReadFileStats());
+    std::map<uint64_t, FileStats> stats_by_number;
+    for (const auto& s : VERIFY_RESULT(ReadFileStats())) {
+      stats_by_number[s.number] = s;
+    }
+    // Contiguity is in level-0 order (by sequence number, the metadata lists newest first), not
+    // by file number: a compaction output has a high number but sits where its inputs were.
+    rocksdb::ColumnFamilyMetaData cf_meta;
+    regular_db_->GetColumnFamilyMetaData(&cf_meta);
+    std::vector<FileStats> stats;
+    for (auto it = cf_meta.levels[0].files.rbegin(); it != cf_meta.levels[0].files.rend(); ++it) {
+      auto found = stats_by_number.find(it->name_id);
+      if (found != stats_by_number.end()) {
+        stats.push_back(found->second);
+      }
+    }
     const size_t group = std::max(1, FLAGS_reclamation_bench_group_files);
     std::vector<std::vector<uint64_t>> groups;
     std::vector<uint64_t> current;
@@ -991,12 +1014,49 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     return result;
   }
 
+  // A point read the way the DocDB read path issues one: with the bloom-aware iterator filter,
+  // so files whose filter excludes the key are skipped and the bloom tickers move.
   Status PointRead(int64_t id) {
+    static const rocksdb::BloomFilterAwareFileFilter bloom_filter_aware_file_filter;
+    const auto key = EncodedKey(id);
+    rocksdb::ReadOptions read_opts;
+    read_opts.query_id = rocksdb::kDefaultQueryId;
+    read_opts.iterator_filter = &bloom_filter_aware_file_filter;
+    read_opts.user_key_for_filter = key.AsSlice();
+    std::unique_ptr<rocksdb::Iterator> iter(regular_db_->NewIterator(read_opts));
+    iter->Seek(key.AsSlice());
+    return iter->status();
+  }
+
+  // Reads every sampled id back: a deleted id must resolve to a tombstone or to nothing, a live
+  // id to a value. A wrongly dropped tombstone shows up as a deleted id reading back as a value,
+  // which the byte and entry counts alone cannot reveal.
+  Status VerifyIds(const Layout& layout) {
     rocksdb::ReadOptions read_opts;
     read_opts.query_id = rocksdb::kDefaultQueryId;
     std::unique_ptr<rocksdb::Iterator> iter(regular_db_->NewIterator(read_opts));
-    iter->Seek(EncodedKey(id).AsSlice());
-    return iter->status();
+    auto newest_is_tombstone = [&](int64_t id) -> Result<std::optional<bool>> {
+      const auto key = EncodedKey(id);
+      iter->Seek(key.AsSlice());
+      // The debug iterator insists that status() is read after Valid() says false.
+      const bool valid = iter->Valid();
+      RETURN_NOT_OK(iter->status());
+      if (!valid || !iter->key().starts_with(key.AsSlice())) {
+        return std::nullopt;
+      }
+      return VERIFY_RESULT(dockv::Value::IsTombstoned(iter->value()));
+    };
+    for (int64_t id : layout.deleted_ids) {
+      const auto tombstoned = VERIFY_RESULT(newest_is_tombstone(id));
+      SCHECK(!tombstoned.has_value() || *tombstoned, IllegalState,
+             Format("Deleted row $0 reads back as a value", id));
+    }
+    for (int64_t id : layout.live_ids) {
+      const auto tombstoned = VERIFY_RESULT(newest_is_tombstone(id));
+      SCHECK(tombstoned.has_value() && !*tombstoned, IllegalState,
+             Format("Live row $0 is missing or tombstoned", id));
+    }
+    return Status::OK();
   }
 
   // Oracle selection: contiguous groups of up to group_files churn files in creation order, each
@@ -1142,6 +1202,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
     result.auto_during_policy = auto_compaction_counter_->snapshot() - auto_after_build;
     SetHistoryCutoffHybridTime(HybridTime::kMin);
     ANNOTATE_UNPROTECTED_WRITE(FLAGS_docdb_reclamation_tombstone_drop) = false;
+    RETURN_NOT_OK(VerifyIds(layout));
     result.after = VERIFY_RESULT(ReadFileState());
 
     {
@@ -1179,6 +1240,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
               << " tombstones_dropped=" << result.probe.tombstones_dropped
               << " kept_probe_hit=" << result.probe.kept_probe_hit
               << " kept_fail_closed=" << result.probe.kept_fail_closed
+              << " probes_disabled=" << result.probe.probes_disabled
               << " auto_compactions_build=" << result.auto_during_build.compactions
               << " auto_write_bytes_build=" << result.auto_during_build.output_bytes
               << " auto_compactions=" << result.auto_during_policy.compactions
@@ -1402,7 +1464,7 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
            "point_deleted_bloom_useful,key_shape,candidate_ratio,probes,tombstones_dropped,"
            "kept_probe_hit,kept_fail_closed,value_format,selection,auto_compactions,churn_kind,"
            "updates_per_wave,auto_compactions_build,auto_write_bytes_build,"
-           "auto_compactions_policy,auto_write_bytes_policy,cold_files_left\n";
+           "auto_compactions_policy,auto_write_bytes_policy,cold_files_left,probes_disabled\n";
   }
 
   static std::string CsvRow(const ArmResult& r) {
@@ -1437,12 +1499,12 @@ class ReclamationCompactionPerfTest : public DocDBTestBase {
             r.probe.probes, r.probe.tombstones_dropped, r.probe.kept_probe_hit,
             r.probe.kept_fail_closed, FLAGS_reclamation_bench_value_format) +
         Format(
-            "$0,$1,$2,$3,$4,$5,$6,$7,$8\n",
+            "$0,$1,$2,$3,$4,$5,$6,$7,$8,$9\n",
             FLAGS_reclamation_bench_selection, FLAGS_reclamation_bench_auto_compactions,
             FLAGS_reclamation_bench_churn_kind, FLAGS_reclamation_bench_updates_per_wave,
             r.auto_during_build.compactions, r.auto_during_build.output_bytes,
             r.auto_during_policy.compactions, r.auto_during_policy.output_bytes,
-            r.cold_files_left);
+            r.cold_files_left, r.probe.probes_disabled);
   }
 
   void AppendCsv(const std::vector<ArmResult>& results) {
