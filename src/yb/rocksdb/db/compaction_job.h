@@ -103,6 +103,12 @@ class CompactionJob {
   // REQUIRED: mutex held
   Status Install(const MutableCFOptions& mutable_cf_options);
 
+  // References the level-0 files the compaction leaves in place, from Prepare (under the DB
+  // mutex) to Install, when DBOptions::hold_level0_other_files_for_compaction asks for it, so the
+  // compaction context can probe them. See CompactionContextOptions::level0_other_files.
+  void HoldLevel0OtherFiles();
+  void ReleaseLevel0OtherFiles();
+
  private:
   struct SubcompactionState;
 
@@ -164,6 +170,9 @@ class CompactionJob {
   Statistics* stats_;
   InstrumentedMutex* db_mutex_;
   BackgroundError* db_bg_error_;
+  // See HoldLevel0OtherFiles.
+  std::vector<FileMetaData*> level0_other_files_;
+  bool level0_other_files_held_ = false;
   // If there were two snapshots with seq numbers s1 and
   // s2 and s1 < s2, and if we find two instances of a key k1 then lies
   // entirely within s1 and s2, then the earlier version of k1 can be safely

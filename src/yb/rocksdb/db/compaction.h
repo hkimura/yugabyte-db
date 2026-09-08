@@ -264,11 +264,6 @@ class Compaction {
   // null under universal compaction, which pins the input files instead of the version.
   Version* input_version() const { return input_version_; }
 
-  // The level-0 files this compaction leaves in place, from the version it was picked from, held
-  // for the compaction's duration (by the pinned version, or by a reference on each file under
-  // universal compaction) so a compaction context can consult them, e.g. probe their filters.
-  const std::vector<FileMetaData*>& level0_other_files() const { return level0_other_files_; }
-
   struct InputLevelSummaryBuffer {
     char buffer[128];
   };
@@ -351,7 +346,6 @@ class Compaction {
   Version* input_version_ = nullptr;
   uint64_t input_version_number_ = 0;
   bool input_version_level0_non_overlapping_ = false;
-  std::vector<FileMetaData*> level0_other_files_;
   VersionSet* vset_ = nullptr;
   VersionEdit edit_;
   const int number_levels_;

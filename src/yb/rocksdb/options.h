@@ -1356,6 +1356,13 @@ struct DBOptions {
 
   std::shared_ptr<CompactionContextFactory> compaction_context_factory;
 
+  // When set and returning true for the number of level-0 files a compaction leaves in place,
+  // the compaction job references those files for its duration (pick to install) and hands them
+  // to the compaction context with a bloom-probe factory, so the context can ask whether a key
+  // exists outside the compaction. Files another compaction obsoletes meanwhile are deleted when
+  // this job installs. Null means never.
+  std::function<bool(size_t num_level0_other_files)> hold_level0_other_files_for_compaction;
+
   // Function that check if file is not eligible for a compaction. Actively used by
   // File TTL expiration to check max file size for compaction.
   // Supported only for level0 of universal style compactions.

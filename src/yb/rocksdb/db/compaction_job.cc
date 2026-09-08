@@ -344,9 +344,56 @@ CompactionJob::CompactionJob(
 
 CompactionJob::~CompactionJob() {
   assert(compact_ == nullptr);
+  assert(!level0_other_files_held_);  // Install releases them; every path installs.
   if (wait_state_) {
     yb::ash::FlushAndCompactionWaitStatesTracker().Untrack(wait_state_);
   }
+}
+
+void CompactionJob::HoldLevel0OtherFiles() {
+  db_mutex_->AssertHeld();
+  if (!db_options_.hold_level0_other_files_for_compaction) {
+    return;
+  }
+  auto* c = compact_->compaction;
+  auto* cfd = c->column_family_data();
+  std::vector<FileMetaData*> others;
+  for (auto* f : cfd->current()->storage_info()->LevelFiles(0)) {
+    bool is_input = false;
+    for (size_t level = 0; level < c->num_input_levels() && !is_input; ++level) {
+      if (c->level(level) != 0) {
+        continue;
+      }
+      const auto* inputs = c->inputs(level);
+      is_input = std::find(inputs->begin(), inputs->end(), f) != inputs->end();
+    }
+    if (!is_input) {
+      others.push_back(f);
+    }
+  }
+  if (!db_options_.hold_level0_other_files_for_compaction(others.size())) {
+    return;
+  }
+  // Same mechanism as the input files under universal compaction: a reference keeps the
+  // metadata and the file alive until ReleaseLevel0OtherFiles.
+  for (auto* f : others) {
+    ++f->refs;
+  }
+  level0_other_files_ = std::move(others);
+  level0_other_files_held_ = true;
+}
+
+void CompactionJob::ReleaseLevel0OtherFiles() {
+  if (!level0_other_files_held_) {
+    return;
+  }
+  db_mutex_->AssertHeld();
+  auto* cfd = compact_->compaction->column_family_data();
+  for (auto* f : level0_other_files_) {
+    versions_->UnrefFile(cfd, f);
+  }
+  level0_other_files_.clear();
+  level0_other_files_held_ = false;
 }
 
 void CompactionJob::ReportStartedCompaction(
@@ -373,6 +420,8 @@ void CompactionJob::Prepare() {
   assert(c->column_family_data() != nullptr);
   assert(c->column_family_data()->current()->storage_info()
       ->NumLevelFiles(compact_->compaction->level()) > 0);
+
+  HoldLevel0OtherFiles();
 
   // Is this compaction producing files at the bottommost level?
   bottommost_level_ = c->bottommost_level();
@@ -591,6 +640,7 @@ Result<FileNumbersHolder> CompactionJob::Run() {
 
 Status CompactionJob::Install(const MutableCFOptions& mutable_cf_options) {
   db_mutex_->AssertHeld();
+  ReleaseLevel0OtherFiles();
   Status status = compact_->status;
   ColumnFamilyData* cfd = compact_->compaction->column_family_data();
   cfd->internal_stats()->AddCompactionStats(
@@ -740,13 +790,16 @@ void CompactionJob::ProcessKeyValueCompaction(
           .boundary_extractor = sub_compact->boundary_extractor,
           .compaction_reason = sub_compact->compaction->compaction_reason(),
       };
-      // The files this compaction leaves in place, held by the compaction for its duration, so
-      // the context can ask their bloom filters whether a key still exists outside the inputs.
-      context.level0_other_files = compact_->compaction->level0_other_files();
-      context.new_file_key_prober = [this, cfd](const FileMetaData& file) {
-        return cfd->table_cache()->NewFileKeyProber(
-            env_options_, cfd->internal_comparator(), file.fd, db_options_.statistics.get());
-      };
+      // The files this job holds (Prepare to Install), so the context can ask their bloom
+      // filters whether a key still exists outside the inputs. Without the hold the context gets
+      // no factory and must assume anything may exist outside.
+      if (level0_other_files_held_) {
+        context.level0_other_files = level0_other_files_;
+        context.new_file_key_prober = [this, cfd](const FileMetaData& file) {
+          return cfd->table_cache()->NewFileKeyProber(
+              env_options_, cfd->internal_comparator(), file.fd, db_options_.statistics.get());
+        };
+      }
       sub_compact->context = (*db_options_.compaction_context_factory)(sub_compact, context);
       sub_compact->feed = sub_compact->context->Feed();
     } else {

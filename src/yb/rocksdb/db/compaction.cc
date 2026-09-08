@@ -106,34 +106,13 @@ void Compaction::SetInputVersion(Version* input_version) {
   cfd_ = input_version->cfd();
   cfd_->Ref();
 
-  // The level-0 files outside this compaction, for contexts that consult them while it runs.
-  level0_other_files_.clear();
-  for (auto* f : input_version->storage_info()->LevelFiles(0)) {
-    bool is_input = false;
-    for (const auto& input_level : inputs_) {
-      if (input_level.level == 0 &&
-          std::find(input_level.files.begin(), input_level.files.end(), f) !=
-              input_level.files.end()) {
-        is_input = true;
-        break;
-      }
-    }
-    if (!is_input) {
-      level0_other_files_.push_back(f);
-    }
-  }
-
   if (IsCompactionStyleUniversal()) {
     // We don't need to lock the whole input version for universal compaction, only need input
-    // files. The other level-0 files are held the same way; a file another compaction obsoletes
-    // meanwhile is then deleted when this compaction finishes rather than at once.
+    // files.
     for (auto& input_level : inputs_) {
       for (auto* f : input_level.files) {
         ++f->refs;
       }
-    }
-    for (auto* f : level0_other_files_) {
-      ++f->refs;
     }
   } else {
     input_version_ = input_version;
@@ -348,9 +327,6 @@ Compaction::~Compaction() {
       for (auto f : input_level.files) {
         vset_->UnrefFile(cfd_, f);
       }
-    }
-    for (auto f : level0_other_files_) {
-      vset_->UnrefFile(cfd_, f);
     }
   }
   if (cfd_ != nullptr) {

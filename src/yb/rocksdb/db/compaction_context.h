@@ -80,8 +80,10 @@ struct CompactionContextOptions {
   const std::vector<FileMetaData*>& level0_inputs;
   BoundaryValuesExtractor* boundary_extractor;
   CompactionReason compaction_reason;
-  // Level-0 files of the version the compaction pinned that are not its inputs, and a factory for
-  // bloom probes over them. Empty and null when the compaction has no pinned version.
+  // The level-0 files the compaction leaves in place, referenced by the job from its start to
+  // its install (DBOptions::hold_level0_other_files_for_compaction), and a factory for bloom
+  // probes over them. The factory is null when the job did not hold them, in which case the
+  // list is empty and says nothing about what exists outside the compaction.
   std::vector<FileMetaData*> level0_other_files;
   FileKeyProberFactory new_file_key_prober;
 };

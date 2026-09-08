@@ -141,6 +141,9 @@ DEFINE_UNKNOWN_int64(db_min_keys_per_index_block, 100,
 DEFINE_UNKNOWN_int64(db_write_buffer_size, -1,
     "Size of RocksDB write buffer (in bytes). -1 to use default.");
 
+DECLARE_bool(docdb_reclamation_tombstone_drop);
+DECLARE_int32(docdb_reclamation_max_probe_files);
+
 DEFINE_UNKNOWN_int32(memstore_size_mb, 128,
     "Max size (in mb) of the memstore, before needing to flush.");
 
@@ -700,6 +703,14 @@ void InitRocksDBBaseOptions(
     : rocksdb::CompactionStyle::kCompactionStyleNone;
   // Set the number of levels to 1.
   options->num_levels = 1;
+
+  // Per-key tombstone drops need the files outside a compaction held and probed; the job holds
+  // them only while the feature is on and the count fits the probe budget.
+  options->hold_level0_other_files_for_compaction = [](size_t num_other_files) {
+    const auto limit = FLAGS_docdb_reclamation_max_probe_files;
+    return FLAGS_docdb_reclamation_tombstone_drop && limit >= 0 &&
+           num_other_files <= static_cast<size_t>(limit);
+  };
 
   AutoInitFromRocksDBFlags(options);
   if (compactions_enabled) {
