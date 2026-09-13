@@ -13048,6 +13048,92 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestPackedRowUpdateFlag)) {
   ASSERT_EQ(insert_count, 1);
   ASSERT_EQ(update_count, 1);
 }
+
+// A packed row whose columns are NULL is emitted without those columns: DoPopulatePackedRows
+// (cdc/cdcsdk_producer.cc:673-676) stashes them in null_value_columns and `continue`s without
+// adding a new_tuple entry. The flush that turns them back into explicit NULL entries exists in
+// both record populators but is gated on the INSERT arm only (:1636-1646 on the single-shard write
+// path, :1265-1281 on the intent path), while a packed row typed as an UPDATE - which
+// IsPackedRowUpdate (:136-142) derives from the V2 header's kIsUpdateFlag - is emitted by the
+// surrounding code without ever running that flush.
+//
+// Since AddColumnToMap (:185-194) deliberately distinguishes a NULL column from an omitted one
+// ("so that we also send NULL values to the walsender ... to be able to differentiate between NULL
+// and Omitted values"), dropping the column is not equivalent to sending it as NULL: a consumer
+// that treats an absent column as unchanged leaves its target value at the pre-UPDATE value.
+//
+// Geometry: two non-key columns, both assigned in one UPDATE statement, which is the condition for
+// the full-row repack at docdb/pgsql_operation.cc:1749-1755 that produces the UPDATE-marked packed
+// row in the first place.
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestPackedRowUpdateFlagWithNullColumn)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_use_packed_row_v2) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_pack_full_row_update) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_mark_update_packed_row) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+
+  ASSERT_OK(SetUpWithParams(1, 1, false));
+  auto table = ASSERT_RESULT(CreateTable(
+      &test_cluster_, test_namespace_name, kTableName, 1 /* num_tablets */, true, false, 0, false,
+      "", "public", 3 /* num_cols */, {kValue2ColumnName}));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+  xrepl::StreamId stream_id = ASSERT_RESULT(CreateConsistentSnapshotStream(
+      CDCSDKSnapshotOption::EXPORT_SNAPSHOT, CDCCheckpointType::EXPLICIT, CDCRecordType::PG_FULL));
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(test_namespace_name));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0($1, $2, $3) VALUES (1, 100, 200)", kTableName, kKeyColumnName,
+      kValueColumnName, kValue2ColumnName));
+  ASSERT_OK(conn.ExecuteFormat(
+      "UPDATE $0 SET $1 = 300, $2 = NULL WHERE $3 = 1", kTableName, kValueColumnName,
+      kValue2ColumnName, kKeyColumnName));
+
+  GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+
+  const RowMessage* update_row_message = nullptr;
+  uint32_t update_count = 0;
+  for (const auto& record : change_resp.cdc_sdk_proto_records()) {
+    if (record.row_message().op() == RowMessage::UPDATE) {
+      ++update_count;
+      update_row_message = &record.row_message();
+    }
+  }
+
+  // Precondition: the UPDATE really did produce a single UPDATE-typed packed row. If the flags had
+  // not taken effect the row would be typed INSERT and the flush at :1636-1646 would run, making
+  // the assertion below pass vacuously.
+  ASSERT_EQ(update_count, 1);
+  ASSERT_TRUE(update_row_message != nullptr);
+
+  const DatumMessagePB* value_1_datum = nullptr;
+  const DatumMessagePB* value_2_datum = nullptr;
+  for (const auto& datum : update_row_message->new_tuple()) {
+    if (datum.column_name() == kValueColumnName) {
+      value_1_datum = &datum;
+    } else if (datum.column_name() == kValue2ColumnName) {
+      value_2_datum = &datum;
+    }
+  }
+
+  // Precondition: the non-NULL half of the same UPDATE is present, with its new value.
+  ASSERT_TRUE(value_1_datum != nullptr) << update_row_message->DebugString();
+  ASSERT_EQ(value_1_datum->datum_int32(), 300);
+
+  // The column set to NULL by the same statement must be reported too, as an explicit NULL.
+  ASSERT_TRUE(value_2_datum != nullptr) << update_row_message->DebugString();
+  ASSERT_EQ(value_2_datum->datum_case(), DatumMessagePB::DATUM_NOT_SET)
+      << update_row_message->DebugString();
+
+  // EquateOldAndNewTuple (cdc/cdcsdk_producer.cc:393-404) pads the shorter of the two lists with
+  // default-constructed, nameless entries, so a column dropped from new_tuple also shows up as a
+  // positional misalignment against old_tuple instead of as an obviously malformed record.
+  for (const auto& datum : update_row_message->new_tuple()) {
+    ASSERT_FALSE(datum.column_name().empty()) << update_row_message->DebugString();
+  }
+}
+
 // This test verifies that we do not miss any records when LogCache::ReadOps() reads WAL Ops from
 // the active segment with combined size greater than FLAGS_consensus_max_batch_size_bytes (default
 // value 4 MB).
