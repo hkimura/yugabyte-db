@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_protocol.pb.h"
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
@@ -249,6 +250,38 @@ std::string TestPackWithControlFields() {
 TEST(PackedRowTest, ControlFields) {
   ASSERT_EQ(TestPackWithControlFields<RowPackerV1>(), "74817A0007000000537072697665744800000039");
   ASSERT_EQ(TestPackWithControlFields<RowPackerV2>(), "74817C00000C70726976657439");
+}
+
+// Builds a YCQL packing over num_value_columns INT32 value columns and asks CouldPack about a
+// request that supplies every one of them - the shape docdb/cql_operation.cc:1103-1112 uses to
+// decide whether a YCQL INSERT is packed.
+void TestCouldPackAllColumnsSupplied(size_t num_value_columns) {
+  auto schema = ASSERT_RESULT(BuildSchema(
+      std::vector<DataType>(num_value_columns, DataType::INT32), /* allow_nullable= */ false));
+  SchemaPacking packing(TableType::YQL_TABLE_TYPE, schema);
+  ASSERT_EQ(packing.columns(), num_value_columns);
+
+  google::protobuf::RepeatedPtrField<QLColumnValuePB> values;
+  for (size_t i = schema.num_key_columns(); i != schema.num_columns(); ++i) {
+    values.Add()->set_column_id(schema.column_id(i).rep());
+  }
+  ASSERT_EQ(static_cast<size_t>(values.size()), num_value_columns);
+
+  ASSERT_TRUE(packing.CouldPack(values))
+      << "CouldPack rejected a request supplying all " << num_value_columns << " value columns";
+}
+
+// SchemaPacking::DoCouldPack (schema_packing.cc:631-642) gates on
+// values.size() != column_to_idx_.size(), and IdMapping::size() over-counts by the surviving
+// population on every rehash. IdMapping's initial capacity is 16 (id_mapping.h:173) and
+// SchemaPacking's ctor puts exactly one entry per non-key column into column_to_idx_
+// (schema_packing.cc:499-536), so the 17th non-key column is the first rehash and from there on
+// YCQL packing silently never engages, however the ycql_enable_packed_row flag is set.
+TEST(PackedRowTest, CouldPackWideTable) {
+  // Control: 16 non-key columns fit the initial capacity, so the count is exact.
+  ASSERT_NO_FATALS(TestCouldPackAllColumnsSupplied(16));
+  // Reproduction: the 17th forces DoubleCapacity().
+  ASSERT_NO_FATALS(TestCouldPackAllColumnsSupplied(17));
 }
 
 } // namespace yb::dockv

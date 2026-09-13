@@ -64,6 +64,30 @@ TEST(TestIdMapping, TestRehash) {
   }
 }
 
+// size() must count entries, not insertions. DoubleCapacity() (id_mapping.h:160-171) re-inserts
+// every surviving entry through set() (:109-124), which does ++size_, and never resets size_
+// first, so every rehash adds the whole surviving population to the counter a second time.
+TEST(TestIdMapping, SizeAfterRehash) {
+  // Control: below the initial capacity there is no rehash and the count is right.
+  IdMapping small;
+  small.set(1, 10);
+  small.set(2, 20);
+  ASSERT_EQ(small.size(), 2U);
+
+  constexpr int kNumEntries = 100;
+  IdMapping m;
+  for (int i = 0; i < kNumEntries; i++) {
+    m.set(i, i * 10);
+  }
+
+  // Precondition: the rehash itself is correct - every entry is still present and readable.
+  for (int i = 0; i < kNumEntries; i++) {
+    ASSERT_EQ(i * 10, m.get(i));
+  }
+
+  ASSERT_EQ(m.size(), static_cast<size_t>(kNumEntries));
+}
+
 // Generate a random sequence of keys.
 TEST(TestIdMapping, TestRandom) {
   Random r(SeedRandom());
