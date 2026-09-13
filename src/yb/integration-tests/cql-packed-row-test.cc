@@ -409,4 +409,64 @@ TEST_F(CqlPackedRowTest, RemoteBootstrapWithNewChangeMetadataReplayLogic) {
   TestRemoteBootstrap();
 }
 
+// Repro for the fold re-basing a TTL-carrying delta's expiry onto the packed row's (older) hybrid
+// time, so a folded `USING TTL n` value expires early by (delta hybrid time - row hybrid time).
+//
+// The write side preserves the delta's control fields into the packed slot
+// (PackedRowData::ProcessColumn; CompactionSchemaInfo::keep_write_time() is true for YCQL). The
+// read side then computes the slot's expiration from the PACKED ROW's hybrid time --
+// DoDecodePackedColumn passes data_.packed_row->doc_ht() into GetNewExpiration -- while the
+// unfolded twin uses the entry's own write time (AllocateNewStateEntries). A replica that has
+// folded and one that has not therefore disagree about when the value dies, and the folded one
+// kills it at (t_row + n) instead of (t_delta + n).
+//
+// This is the enabled-fold complement of TtlExpiredColumnOverUnmergedPackedRow: with the merge
+// disabled the expired delta is GC'd and the old value resurrects; with the merge enabled the live
+// delta is folded and expires early.
+TEST_F(CqlPackedRowTest, FoldRebasesTtlToPackedRowTime) {
+  // The gap between the packed row and the TTL'd update is how much TTL the fold steals.
+  const auto kGapSec = 10 * kTimeMultiplier;
+  const auto kTtlSec = 15 * kTimeMultiplier;
+  // Read after the re-based expiry (t_row + ttl == t_update + ttl - gap) but well before the real
+  // one (t_update + ttl).
+  const auto kReadAfterUpdateSec = kTtlSec - kGapSec + 4 * kTimeMultiplier;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, value TEXT) WITH tablets = 1"));
+
+  // Packed row with no TTL at t_row.
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, value) VALUES (1, 'one')"));
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 1));
+
+  std::this_thread::sleep_for(1s * kGapSec);
+
+  // Live delta with an explicit TTL at t_update = t_row + gap.
+  ASSERT_OK(session.ExecuteQueryFormat(
+      "UPDATE t USING TTL $0 SET value = 'dva' WHERE key = 1", kTtlSec));
+  const auto update_time = std::chrono::steady_clock::now();
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 2));
+  ASSERT_OK(CheckTableContent(&session, "1,dva", "key = 1"));
+
+  // Folds the still-live delta into the packed row. Two records became one, so the compaction did
+  // collapse them; on its own that is also consistent with the delta surviving alone, but the
+  // delta alone would still serve 'dva' at the read below (its own TTL has not run out), so a
+  // NULL there can only come from the folded packed row. Without this check the rest of the test
+  // would be vacuous.
+  ASSERT_OK(cluster_->CompactTablets());
+  ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 1));
+
+  std::this_thread::sleep_until(update_time + 1s * kReadAfterUpdateSec);
+  // Guard against a slow setup turning a legitimate expiry into a false positive.
+  ASSERT_TRUE(std::chrono::steady_clock::now() < update_time + 1s * (kTtlSec - 2 * kTimeMultiplier))
+      << "the setup took so long that the value would have expired for real";
+
+  // t_update + ttl is still in the future, so the value must be there. If the expiry was re-based
+  // onto the packed row's hybrid time it died at t_row + ttl, which is already in the past.
+  ASSERT_OK(CheckTableContent(&session, "1,dva", "key = 1"));
+}
+
 } // namespace yb
