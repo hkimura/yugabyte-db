@@ -104,6 +104,8 @@ class PgPackedRowTestDisableTableLocks : public PgPackedRowTest {
   void TestCompactionWithConcurrentAggregate(
       PGConn& conn, const std::string& pre_compaction_query, const std::string& aggregate_query,
       int64_t expected_aggregate_result);
+
+  void TestCompactionTargetWithAddedColumn(bool pin_pre_alter_schema);
 };
 
 void PgPackedRowTest::TestSimple() {
@@ -1680,6 +1682,130 @@ TEST_P(PgPackedRowTestDisableTableLocks, SchemaPinnedByReadGc) {
 
   const auto row_count = ASSERT_RESULT(conn.FetchRow<int64_t>("SELECT COUNT(*) FROM test"));
   ASSERT_EQ(row_count, kNumRows);
+}
+
+// Body shared by ClampedCompactionTargetDropsAddedColumn (pin_pre_alter_schema = true, the repro)
+// and UnclampedCompactionTargetKeepsAddedColumn (false, the control). The two runs differ in
+// exactly one thing: whether a pre-ALTER TableInfo is still alive when the compaction picks its
+// target packing. See the comments on the two TEST_P entries below.
+void PgPackedRowTestDisableTableLocks::TestCompactionTargetWithAddedColumn(
+    bool pin_pre_alter_schema) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_leader_failure_detection) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.Execute(
+      "CREATE TABLE test (key INT PRIMARY KEY, value INT) SPLIT INTO 1 TABLETS"));
+
+  // Packed at schema version 0, i.e. before the column is added.
+  ASSERT_OK(conn.Execute("INSERT INTO test VALUES (1, 100)"));
+  ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  const auto tablets =
+      ASSERT_RESULT(ListTabletsForTableName(cluster_.get(), "test", ListPeersFilter::kLeaders));
+  ASSERT_EQ(tablets.size(), 1);
+  auto& tablet = *tablets[0].get();
+
+  // Keep the pre-ALTER TableInfo alive. Its DocReadContext owns a SchemaPackingStorage whose max
+  // version is 0, and that storage stays registered in the table's SchemaPackingRegistry for as
+  // long as the TableInfo lives (schema_packing.cc UpdateMaxSchemaVersion/Register), so
+  // MinActiveVersion() stays 0. This is the state a long running compaction leaves behind: the
+  // CompactionSchemaInfo it took at start aliases the TableInfoPtr (TableInfo::Packing ->
+  // SharedField) and holds it for the whole compaction; the same pin is what upstream's
+  // SchemaPinnedByCompactionGc exercises. The pin is taken directly here so that the history
+  // cutoff is left alone, which an active reader would not do.
+  auto pinned_table_info = tablet.metadata()->primary_table_info();
+  ASSERT_EQ(pinned_table_info->schema_version, 0);
+  if (!pin_pre_alter_schema) {
+    pinned_table_info.reset();
+  }
+
+  // Schema version 1 adds c1.
+  ASSERT_OK(conn.Execute("ALTER TABLE test ADD COLUMN c1 INT"));
+  LOG(INFO) << "ALTER TABLE done";
+
+  // Standalone-delta leg.
+  ASSERT_OK(conn.Execute("UPDATE test SET c1 = 42 WHERE key = 1"));
+  // Repack-downgrade leg.
+  ASSERT_OK(conn.Execute("INSERT INTO test VALUES (2, 200, 7)"));
+  ASSERT_OK(conn.Execute("UPDATE test SET value = 201 WHERE key = 2"));
+
+  ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  // Both rows read correctly before the compaction.
+  ASSERT_EQ(
+      ASSERT_RESULT(conn.FetchRow<std::optional<int32_t>>("SELECT c1 FROM test WHERE key = 1")),
+      42);
+  ASSERT_EQ(
+      ASSERT_RESULT(conn.FetchRow<std::optional<int32_t>>("SELECT c1 FROM test WHERE key = 2")),
+      7);
+
+  {
+    auto current_table_info = tablet.metadata()->primary_table_info();
+    ASSERT_EQ(current_table_info->schema_version, 1);
+    auto min_active =
+        current_table_info->doc_read_context->schema_packing_storage.registry().MinActiveVersion();
+    LOG(INFO) << "MinActiveVersion: " << AsString(min_active)
+              << ", current schema version: " << current_table_info->schema_version
+              << ", pinned: " << pin_pre_alter_schema;
+    // The pin is the only difference between the two instantiations of this body, and this is
+    // where it shows up: with the pin the compaction target below is clamped to v0, without it
+    // the target is the current v1.
+    ASSERT_EQ(min_active, pin_pre_alter_schema ? 0 : 1);
+  }
+
+  // Asks for kLatestSchemaVersion; TableInfo::Packing clamps that to MinActiveVersion().
+  ASSERT_OK(cluster_->CompactTablets());
+
+  const auto standalone_leg =
+      ASSERT_RESULT(conn.FetchRow<std::optional<int32_t>>("SELECT c1 FROM test WHERE key = 1"));
+  const auto downgrade_leg =
+      ASSERT_RESULT(conn.FetchRow<std::optional<int32_t>>("SELECT c1 FROM test WHERE key = 2"));
+  // EXPECT rather than ASSERT so that a single run reports both legs.
+  EXPECT_EQ(standalone_leg, 42)
+      << "standalone-delta leg: the added column's delta was dropped by the compaction target";
+  EXPECT_EQ(downgrade_leg, 7)
+      << "repack-downgrade leg: the added column's packed slot was dropped by the compaction "
+      << "target";
+}
+
+// Repro for the MinActiveVersion-clamped compaction target dropping records of columns that were
+// added after the clamped version.
+//
+// TableInfo::Packing(kLatestSchemaVersion, ...) clamps the compaction target packing down to
+// SchemaPackingRegistry::MinActiveVersion() (tablet_metadata.cc:440-449). Anything holding a
+// pre-ALTER DocReadContext -- a long running compaction, or any other holder of the old
+// TableInfoPtr -- therefore makes an OLD schema version the target packing of an unrelated
+// compaction. PackedRowData::ProcessColumn treats a column id that is absent from the target
+// packing as "column was deleted" and consumes (drops) the record
+// (docdb_compaction_context.cc:310-318); a column ADDED after the target version is absent from it
+// too (SchemaPacking::SkippedColumn is true only for an explicit kSkippedColumnIdx entry,
+// schema_packing.cc:567-570), so its data is destroyed rather than folded.
+//
+// Two legs are exercised in one compaction:
+//   key = 1  standalone-delta leg: the row is packed at v0, the column is added at v1 and its
+//            value arrives as a standalone delta. ProcessColumn drops that delta.
+//   key = 2  repack-downgrade leg: the row is inserted after the ALTER so its packed row is at v1
+//            and already carries the added column. Updating any other column of that row makes
+//            ProcessColumn call StartRepacking, which re-encodes the row at the clamped v0
+//            packing; Flush() packs target columns only, so the added column's packed slot goes
+//            away with it.
+//
+// UnclampedCompactionTargetKeepsAddedColumn below is the same scenario without the pin and must
+// pass; together the two isolate the clamp as the cause.
+TEST_P(PgPackedRowTestDisableTableLocks, ClampedCompactionTargetDropsAddedColumn) {
+  TestCompactionTargetWithAddedColumn(/* pin_pre_alter_schema= */ true);
+}
+
+// Control for the test above. Identical scenario -- same ALTER, same writes, same full compaction
+// of the same records -- except that no pre-ALTER TableInfo is kept alive, so MinActiveVersion()
+// is the current schema version and the compaction target is not clamped. This must pass on
+// master: it rules out "ALTER plus a full compaction loses the added column" as the explanation
+// and leaves the clamp as the only difference.
+TEST_P(PgPackedRowTestDisableTableLocks, UnclampedCompactionTargetKeepsAddedColumn) {
+  TestCompactionTargetWithAddedColumn(/* pin_pre_alter_schema= */ false);
 }
 
 INSTANTIATE_TEST_SUITE_P(
