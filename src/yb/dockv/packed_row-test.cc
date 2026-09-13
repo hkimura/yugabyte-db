@@ -16,6 +16,7 @@
 #include "yb/common/ql_value.h"
 #include "yb/common/schema.h"
 
+#include "yb/dockv/dockv.pb.h"
 #include "yb/dockv/dockv_test_util.h"
 #include "yb/dockv/packed_row.h"
 #include "yb/dockv/packed_value.h"
@@ -249,6 +250,58 @@ std::string TestPackWithControlFields() {
 TEST(PackedRowTest, ControlFields) {
   ASSERT_EQ(TestPackWithControlFields<RowPackerV1>(), "74817A0007000000537072697665744800000039");
   ASSERT_EQ(TestPackWithControlFields<RowPackerV2>(), "74817C00000C70726976657439");
+}
+
+// Builds the ColumnPackingPB shape a tserver older than cd2c03a01be (2023-08-03, the commit that
+// added the optional data_type field) persisted into old_schema_packings and into every backup
+// taken in that era: every field present except data_type.
+SchemaPackingPB MakeSchemaPackingPB(bool with_data_type) {
+  SchemaPackingPB pb;
+  pb.set_schema_version(1);
+  auto* column = pb.add_columns();
+  column->set_id(static_cast<uint32_t>(kFirstColumnId.rep() + 1));
+  column->set_num_varlen_columns_before(0);
+  column->set_offset_after_prev_varlen_column(0);
+  column->set_size(5);
+  column->set_nullable(false);
+  if (with_data_type) {
+    column->set_data_type(PersistentDataType::INT32);
+  }
+  return pb;
+}
+
+// SchemaPacking::HasDataType() is the only guard in the tree for "this packing predates the
+// per-column data types that V2 packing needs"; its sole caller is the V2->V1 degrade in
+// PackedRowData::InitPacker (docdb/docdb_compaction_context.cc:399-405). A packing deserialized
+// from a pre-2023-08 SchemaPackingPB has no data types, so the guard must report false for it.
+TEST(PackedRowTest, LegacyPackingHasNoDataType) {
+  // Control 1 (passes today): with data_type present the packing is V2-capable.
+  auto modern_pb = MakeSchemaPackingPB(/* with_data_type= */ true);
+  ASSERT_TRUE(modern_pb.columns(0).has_data_type());
+  SchemaPacking modern_packing(modern_pb);
+  EXPECT_TRUE(modern_packing.HasDataType());
+
+  // Control 2 (passes today): a packing built from a live Schema always carries data types.
+  auto schema = ASSERT_RESULT(BuildSchema({DataType::INT32}, /* allow_nullable= */ false));
+  EXPECT_TRUE(SchemaPacking(TableType::PGSQL_TABLE_TYPE, schema).HasDataType());
+
+  // The legacy packing: data_type is absent on the wire.
+  auto legacy_pb = MakeSchemaPackingPB(/* with_data_type= */ false);
+  ASSERT_FALSE(legacy_pb.columns(0).has_data_type());
+  SchemaPacking legacy_packing(legacy_pb);
+  ASSERT_EQ(legacy_packing.columns(), 1);
+
+  // Diagnostic, not the defect: whichever sentinel ColumnPackingData::FromPB produces for the
+  // absent proto2 field, it has to be one that means "no data type here".
+  const auto data_type = legacy_packing.column_packing_data(0).data_type;
+  LOG(INFO) << "data_type deserialized from an absent proto2 field: " << data_type;
+  EXPECT_TRUE(data_type == DataType::UNKNOWN_DATA || data_type == DataType::NULL_VALUE_TYPE)
+      << "unexpected sentinel for an absent data_type: " << data_type;
+
+  // The reproduction. Under correct behaviour the guard sees the legacy packing for what it is;
+  // at the pin it returns true because FromPB yields UNKNOWN_DATA (999, the proto2 default for
+  // this enum) while the guard only tests against NULL_VALUE_TYPE (0).
+  ASSERT_FALSE(legacy_packing.HasDataType());
 }
 
 } // namespace yb::dockv
