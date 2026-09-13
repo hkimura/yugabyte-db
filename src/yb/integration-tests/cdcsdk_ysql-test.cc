@@ -53,6 +53,7 @@ DECLARE_uint64(transaction_resend_applying_interval_usec);
 DECLARE_bool(TEST_disable_apply_committed_transactions);
 DECLARE_bool(cdc_pg_create_grpc_stream);
 DECLARE_bool(ysql_yb_enable_listen_notify);
+DECLARE_bool(TEST_cdcsdk_fail_populate_intent_record_once);
 
 namespace yb {
 
@@ -7212,6 +7213,83 @@ TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestTransactionWithZeroIntents)) 
   GetChangesResponsePB change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, fk_tablets));
 
   change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, parent_tablets));
+}
+
+// ProcessIntentsWithInvalidSchemaRetry (cdc/cdcsdk_producer.cc:1949-1993) reacts to a failed first
+// attempt by truncating the records that attempt added (:1972-1974), clearing the schema cache
+// (:1977-1983) and calling ProcessIntents again (:1987-1991) with the SAME keyValueIntents vector
+// and the SAME stream_state cursor it passed the first time. Neither is rewound:
+//   - ProcessIntents (:1882) hands stream_state to Tablet::GetIntentsForCDC as an in/out resume
+//     cursor, and docdb::GetIntentsBatchForCDC (docdb/docdb.cc:392-397) seeks from it only while
+//     stream_state->active() && write_id != 0, so a cursor left empty by a fully drained first
+//     attempt makes the second attempt re-seek from the transaction's reverse-index prefix;
+//   - GetIntentsBatchForCDC only push_backs into key_value_intents (docdb/docdb.cc:500) and never
+//     clears it, and the caller declares `std::vector<docdb::IntentKeyValueForCDC> intents;` once
+//     per APPLY record (cdcsdk_producer.cc:3052), outside the wrapper.
+// So the second attempt appends a full second copy of the transaction's intents to the first, and
+// PopulateCDCSDKIntentRecord walks all 2N, emitting every row twice inside the one BEGIN/COMMIT
+// block that ProcessIntents re-adds.
+//
+// The injected failure is the only way to reach the retry deterministically; it is shaped like the
+// schema-mismatch error the wrapper was written for.
+TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestIntentSchemaRetryDoesNotDuplicateTransaction)) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ysql_enable_packed_row) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_populate_end_markers_transactions) = true;
+  ASSERT_OK(SetUpWithParams(1, 1, false));
+
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, test_namespace_name, kTableName));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
+  ASSERT_EQ(tablets.size(), 1);
+
+  xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(IMPLICIT));
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
+  ASSERT_FALSE(set_resp.has_error());
+
+  // One explicit transaction, three distinct keys, well under cdc_max_stream_intent_records so the
+  // first attempt drains the whole transaction and leaves the cursor empty.
+  const int kNumRows = 3;
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(test_namespace_name));
+  ASSERT_OK(conn.Execute("BEGIN"));
+  for (int i = 1; i <= kNumRows; ++i) {
+    ASSERT_OK(conn.ExecuteFormat(
+        "INSERT INTO $0($1, $2) VALUES ($3, $4)", kTableName, kKeyColumnName, kValueColumnName, i,
+        i * 100));
+  }
+  ASSERT_OK(conn.Execute("COMMIT"));
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_cdcsdk_fail_populate_intent_record_once) = true;
+  auto change_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+  // Precondition: the injected failure fired, so the retry path really was taken. Without this the
+  // assertions below would pass vacuously on a response built by a single attempt.
+  ASSERT_FALSE(ANNOTATE_UNPROTECTED_READ(FLAGS_TEST_cdcsdk_fail_populate_intent_record_once));
+
+  int begin_count = 0;
+  int commit_count = 0;
+  std::vector<int32_t> insert_keys;
+  for (const auto& record : change_resp.cdc_sdk_proto_records()) {
+    switch (record.row_message().op()) {
+      case RowMessage::BEGIN:
+        ++begin_count;
+        break;
+      case RowMessage::COMMIT:
+        ++commit_count;
+        break;
+      case RowMessage::INSERT:
+        insert_keys.push_back(record.row_message().new_tuple(0).datum_int32());
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Precondition: the transaction was streamed as one block.
+  ASSERT_EQ(begin_count, 1);
+  ASSERT_EQ(commit_count, 1);
+
+  // The retry must re-emit the transaction, not append a second copy of it.
+  std::sort(insert_keys.begin(), insert_keys.end());
+  ASSERT_EQ(insert_keys, (std::vector<int32_t>{1, 2, 3}));
 }
 
 TEST_F(CDCSDKYsqlTest, YB_DISABLE_TEST_IN_TSAN(TestGetCheckpointForColocatedTable)) {

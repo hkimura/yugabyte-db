@@ -119,6 +119,12 @@ DEFINE_test_flag(bool, cdc_make_consistent_stream_safe_time_invalid, false,
                  "This simulates the scenario when a GetChanges call is being served during tablet "
                  "shutdown.");
 
+DEFINE_test_flag(bool, cdcsdk_fail_populate_intent_record_once, false,
+                 "When set to true, the first call to PopulateCDCSDKIntentRecord clears this flag "
+                 "and returns a schema-mismatch-shaped NotFound, so that "
+                 "ProcessIntentsWithInvalidSchemaRetry takes its retry path exactly once. Used to "
+                 "test that retry.");
+
 DECLARE_bool(ysql_enable_packed_row);
 DECLARE_bool(ysql_yb_enable_replica_identity);
 DECLARE_bool(TEST_ysql_yb_enable_replication_slot_transactional_ddl);
@@ -999,6 +1005,11 @@ Status PopulateCDCSDKIntentRecord(
     client::YBClient* client,
     const bool& end_of_transaction,
     CDCThroughputMetrics* throughput_metrics) {
+  if (FLAGS_TEST_cdcsdk_fail_populate_intent_record_once) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_cdcsdk_fail_populate_intent_record_once) = false;
+    return STATUS(NotFound, "Schema packing not found: TEST");
+  }
+
   auto tablet = VERIFY_RESULT(tablet_peer->shared_tablet());
 
   const bool colocated = tablet->metadata()->colocated();
