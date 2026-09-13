@@ -2627,5 +2627,93 @@ TEST_F(DocRowwiseIteratorTest, HtRollbackUpdatedRow) {
       &projection);
 }
 
+// Repro for the fast backward scan discarding a row tombstone row-atomically. If ANY projected
+// column carries an update newer than the tombstone, FlatGetHelper::HandleRootRecord skips the
+// tombstone outright (doc_reader.cc:901-935; data_.packed_row->HasUpdatesAfter() is a single
+// row-level question, backed by one latest-update pointer, schema_packing.cc:654-656 and
+// :700-702), so DoHandleRootRecord's wipe never runs and columns that were NOT rewritten after the
+// delete keep serving their pre-delete values. A forward scan of the very same snapshot answers
+// correctly, so the two directions disagree about the same data.
+//
+// Vanilla YSQL cannot produce a partial write after a row delete -- an INSERT binds every real
+// non-key column including NULLs (YBCApplyInsertRow, ybModifyTable.c:320-385) and an UPDATE needs
+// a live row -- so the shape is written here at the DocDB level. Producer and consumer have to be
+// argued separately, and only one pairing is fully established:
+//
+//   xCluster (established both ends). A replicated write lands at the SOURCE hybrid time
+//   (rocksdb_writer.cc:240-245, write_operation.cc:139-143, tablet.cc:2029-2038) and carries only
+//   the columns the source UPDATE changed, because the producer copies raw WAL pairs
+//   (xcluster_producer.cc:162-164) and a partial YSQL UPDATE emits per-column KVs unless
+//   ysql_enable_pack_full_row_update is on, which it is not by default
+//   (pgsql_operation.cc:127-128, :1750-1789). So in same-key bidirectional replication a column
+//   update from the other universe can land above a locally written row tombstone. The consumer is
+//   then an ordinary YSQL backward scan on the target.
+//
+//   PITR restore patch (producer established, consumer only statically reachable). The patch does
+//   write partial column records and tombstones at one hybrid time on the sys catalog tablet
+//   (RestorePatch::ProcessExistingOnlyEntry, restore_util.cc:252-276). Whether anything actually
+//   reads those rows with a fast backward scan was NOT established: the gate is reachable on paper
+//   -- table_type_ comes from the scan spec's client type rather than the tablet's primary table
+//   (doc_rowwise_iterator.cc:169-170), so a PgsqlReadRequest against a pg catalog cotable in the
+//   master's sys catalog tablet gets kFlat, and a backward scan direction is reachable from user
+//   SQL (yb_scan_core.c:448-451) -- but no test or trace exercises it, and the master's own sys
+//   catalog scans go through InitForTableType, which leaves is_forward_scan_ true
+//   (sys_catalog.cc:1082, doc_rowwise_iterator.cc:146).
+TEST_F(DocRowwiseIteratorTest, FastBackwardScanDropsRowTombstoneOverPartialRewrite) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_fast_backward_scan) = true;
+
+  const auto& schema = doc_read_context().schema();
+  const auto doc_key = dockv::MakeDocKey(kStrKey1, kIntKey1);
+
+  // Two value columns of one row.
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, KeyEntryValue::MakeColumnId(30_ColId)),
+      QLValue::Primitive("row1_c"), HybridTime::FromMicros(1000)));
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, KeyEntryValue::MakeColumnId(40_ColId)),
+      QLValue::PrimitiveInt64(10000), HybridTime::FromMicros(1000)));
+
+  // The row is deleted.
+  ASSERT_OK(DeleteSubDoc(DocPath(kEncodedDocKey1), HybridTime::FromMicros(2000)));
+
+  // Only column 30 is written back afterwards. Column 40 stays deleted.
+  ASSERT_OK(SetPrimitive(
+      DocPath(kEncodedDocKey1, KeyEntryValue::MakeColumnId(30_ColId)),
+      QLValue::Primitive("row1_c_new"), HybridTime::FromMicros(3000)));
+
+  auto scan = [this, &schema, &doc_key](bool is_forward) -> Result<std::string> {
+    static const DocKey kDefaultStartDocKey;
+    auto pending_op = ScopedRWOperation::TEST_Create();
+    DocPgsqlScanSpec spec(
+        schema, rocksdb::kDefaultQueryId, doc_key, /* hash_code= */ std::nullopt,
+        /* max_hash_code= */ std::nullopt, kDefaultStartDocKey, is_forward);
+    auto iter = MakeIterator(
+        schema, doc_read_context(), kNonTransactionalOperationContext, doc_db(),
+        ReadOperationData::FromReadTime(ReadHybridTime::FromMicros(4000)), pending_op);
+    RETURN_NOT_OK(iter->Init(spec));
+    if (iter->TEST_use_fast_backward_scan() == is_forward) {
+      return STATUS_FORMAT(
+          IllegalState, "Scan direction $0 did not select the intended reader", is_forward);
+    }
+    dockv::ReaderProjection reader_projection(schema);
+    dockv::PgTableRow row(reader_projection);
+    std::string result;
+    while (VERIFY_RESULT(iter->PgFetchNext(&row))) {
+      result += VERIFY_RESULT(PgTableRowToString(schema, row, nullptr));
+    }
+    return result;
+  };
+
+  const auto forward = ASSERT_RESULT(scan(/* is_forward= */ true));
+  const auto backward = ASSERT_RESULT(scan(/* is_forward= */ false));
+  LOG(INFO) << "forward scan:  " << forward;
+  LOG(INFO) << "backward scan: " << backward;
+
+  // Column 40 was deleted at 2000 and never written again, so it reads as null.
+  const std::string kExpected = R"#({string:"row1",int64:11111,string:"row1_c_new",null,null})#";
+  EXPECT_EQ(forward, kExpected);
+  EXPECT_EQ(backward, kExpected);
+}
+
 }  // namespace docdb
 }  // namespace yb
