@@ -11,19 +11,28 @@
 // under the License.
 //
 
+#include <limits>
+#include <string>
+#include <unordered_map>
+
 #include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
 
 #include "yb/common/transaction.h"
 #include "yb/docdb/docdb-internal.h"
 #include "yb/docdb/docdb-test.h"
 
 #include "yb/docdb/docdb.messages.h"
+#include "yb/docdb/doc_read_context.h"
 #include "yb/docdb/doc_vector_index.h"
 #include "yb/docdb/rocksdb_writer.h"
 #include "yb/dockv/doc_vector_id.h"
 #include "yb/dockv/dockv_fwd.h"
 #include "yb/dockv/key_entry_value.h"
+#include "yb/dockv/packed_row.h"
 #include "yb/dockv/partition.h"
+
+#include "yb/util/tostring.h"
 
 #include "yb/vector_index/vector_index_fwd.h"
 
@@ -718,6 +727,171 @@ TEST_F(NonTransactionalBatchWriterTest, ClearsCanAdvanceIntentsFlushOpId) {
       put_batch, kWriteHT, kBatchHT, /* vector_indexes= */ nullptr, StorageSet::All(),
       TableType::PGSQL_TABLE_TYPE, &can_advance));
   ASSERT_FALSE(can_advance.load());
+}
+
+namespace {
+
+// Column ids are spelled out rather than derived from kFirstColumnId, which is 0 in a plain build
+// and 10 under the sanitizers.
+constexpr ColumnIdRep kCensusKeyColumnId = 10;
+constexpr ColumnIdRep kCensusValueColumnId = 20;
+
+// Two schema versions, so the control below can tell the two tables' census entries apart.
+constexpr SchemaVersion kCensusSchemaVersionA = 7;
+constexpr SchemaVersion kCensusSchemaVersionB = 9;
+
+const char* const kCensusCotableA = "00000000-0000-0000-0000-0000000000a1";
+const char* const kCensusCotableB = "00000000-0000-0000-0000-0000000000b2";
+
+}  // namespace
+
+// Fixture for the schema-version census the writer is supposed to leave in the ConsensusFrontiers.
+// It differs from the base fixture only in having a non-empty schema, so the packed rows below are
+// real packed rows carrying a real column.
+class NonTransactionalBatchWriterCensusTest : public NonTransactionalBatchWriterTest {
+ public:
+  Schema CreateSchema() override {
+    return Schema({
+        ColumnSchema("k", DataType::STRING, ColumnKind::RANGE_ASC_NULL_FIRST),
+        ColumnSchema("v", DataType::INT64, ColumnKind::VALUE, Nullable::kTrue),
+    }, {
+        ColumnId(kCensusKeyColumnId),
+        ColumnId(kCensusValueColumnId),
+    });
+  }
+
+  void SetUp() override {
+    NonTransactionalBatchWriterTest::SetUp();
+    // DocReadContext::TEST_Create registers the schema at version 0 only. Register the versions
+    // the packed rows below are written at so the packer has a real packing to pack against.
+    doc_read_context().schema_packing_storage.AddSchema(kCensusSchemaVersionA, CreateSchema());
+    doc_read_context().schema_packing_storage.AddSchema(kCensusSchemaVersionB, CreateSchema());
+  }
+
+ protected:
+  // A real packed row at `version` -- V1, the packed row version this fixture's YQL_TABLE_TYPE
+  // packing storage uses. This is the value shape an xCluster target receives for a packed row:
+  // kPackedRowV1, the schema version as a varint, then the packed columns.
+  Result<std::string> PackedRow(SchemaVersion version, int64_t value) {
+    const auto& packing =
+        VERIFY_RESULT_REF(doc_read_context().schema_packing_storage.GetPacking(version));
+    dockv::RowPackerV1 packer(
+        version, packing, /* packed_size_limit= */ std::numeric_limits<int64_t>::max(),
+        /* value_control_fields= */ Slice());
+    RETURN_NOT_OK(packer.AddValue(ColumnId(kCensusValueColumnId), QLValue::PrimitiveInt64(value)));
+    return VERIFY_RESULT(packer.Complete()).ToBuffer();
+  }
+
+  // Mirrors Tablet::ApplyOperation + Tablet::ApplyKeyValueRowOperations for a non-transactional
+  // batch (the path xCluster external records and YSQL/YCQL single-shard writes take), but hands
+  // the ConsensusFrontiers back so the test can inspect the census the writer left in them.
+  Status ApplyBatch(
+      const docdb::LWKeyValueWriteBatchPB& put_batch, HybridTime write_ht, HybridTime batch_ht,
+      ConsensusFrontiers* frontiers) {
+    // What Tablet::ApplyOperation puts in the frontiers before handing them to the writer. It also
+    // copies write_batch.table_schema_version() in, but nothing populates that field on the
+    // xCluster consumer path -- the frontier census is the writer's job there.
+    set_op_id(OpId(1, 1), frontiers);
+    set_hybrid_time(batch_ht, frontiers);
+
+    rocksdb::WriteBatch intents_write_batch;
+    NonTransactionalBatchWriter batcher(
+        put_batch, write_ht, batch_ht, intents_db(), &intents_write_batch, *this, *frontiers,
+        /* vector_indexes= */ nullptr, StorageSet::All(),
+        // YQL_TABLE_TYPE keeps the vector-index updater (PGSQL-only) out of the picture: it would
+        // decode the packed row against this fixture's provider, which reports YQL_TABLE_TYPE
+        // packings and so trips an unrelated DCHECK in VectorIndexesUpdater::FeedPackedRow. The
+        // schema-version census under test is table-type independent.
+        TableType::YQL_TABLE_TYPE,
+        /* can_advance_intents_flush_op_id= */ nullptr);
+
+    rocksdb::WriteBatch regular_write_batch;
+    regular_write_batch.SetFrontiers(frontiers);
+    regular_write_batch.SetDirectWriter(&batcher);
+    return regular_db_->Write(write_options(), &regular_write_batch);
+  }
+
+  // The census as Tablet::FillMinSchemaVersion reads it out of a frontier before handing it to
+  // RaftGroupMetadata::OldSchemaGC.
+  static std::unordered_map<Uuid, SchemaVersion> Census(const ConsensusFrontier& frontier) {
+    std::unordered_map<Uuid, SchemaVersion> result;
+    frontier.MakeExternalSchemaVersionsAtMost(&result);
+    return result;
+  }
+};
+
+// Repro. NonTransactionalBatchWriter::Apply() -- the writer for non-transactional and xCluster
+// external applies -- calls UpdateSchemaVersion() per write pair, which only accumulates
+// min_schema_version_ / max_schema_version_. Those reach the frontiers only via
+// FlushSchemaVersion(), which Apply() never calls and no destructor calls either. So a batch of
+// replicated packed rows leaves the frontiers with no schema-version census at all, and
+// Tablet::FillMinSchemaVersion cannot see the packings those rows need.
+TEST_F(NonTransactionalBatchWriterCensusTest, ExternalApplyCensusesPackedRowSchemaVersion) {
+  const DocKey doc_key(MakeKeyEntryValues("row1"));
+  const auto packed_row = ASSERT_RESULT(PackedRow(kCensusSchemaVersionA, 42));
+
+  docdb::LWKeyValueWriteBatchPB put_batch(&arena_);
+  auto* write_pair = put_batch.add_write_pairs();
+  write_pair->dup_key(doc_key.Encode().AsSlice());
+  write_pair->dup_value(packed_row);
+
+  ConsensusFrontiers frontiers;
+  ASSERT_OK(ApplyBatch(put_batch, 6000_usec_ht, 5000_usec_ht, &frontiers));
+
+  const auto smallest = Census(frontiers.Smallest());
+  const auto largest = Census(frontiers.Largest());
+
+  ASSERT_EQ(smallest.count(Uuid::Nil()), 1U)
+      << "Smallest frontier has no schema version for the primary table; census: "
+      << AsString(smallest);
+  ASSERT_EQ(largest.count(Uuid::Nil()), 1U)
+      << "Largest frontier has no schema version for the primary table; census: "
+      << AsString(largest);
+  EXPECT_EQ(smallest.at(Uuid::Nil()), kCensusSchemaVersionA);
+  EXPECT_EQ(largest.at(Uuid::Nil()), kCensusSchemaVersionA);
+}
+
+// Control for the above: the same batch, but its pairs span two cotable ids. The cotable change
+// between consecutive pairs is one of the two mid-batch FlushSchemaVersion() calls inside
+// UpdateSchemaVersion, so the FIRST table's census does reach the frontiers -- the machinery works
+// whenever something flushes it. It is the LAST table of a batch that is dropped, and a real batch
+// covers a single table, so in practice that is the whole census.
+TEST_F(NonTransactionalBatchWriterCensusTest, ExternalApplyLosesLastTableOfBatch) {
+  const auto cotable_a = ASSERT_RESULT(Uuid::FromString(kCensusCotableA));
+  const auto cotable_b = ASSERT_RESULT(Uuid::FromString(kCensusCotableB));
+
+  const DocKey doc_key_a(cotable_a, /* hash= */ 0, MakeKeyEntryValues("row_a"));
+  const DocKey doc_key_b(cotable_b, /* hash= */ 1, MakeKeyEntryValues("row_b"));
+  const auto packed_row_a = ASSERT_RESULT(PackedRow(kCensusSchemaVersionA, 42));
+  const auto packed_row_b = ASSERT_RESULT(PackedRow(kCensusSchemaVersionB, 43));
+
+  docdb::LWKeyValueWriteBatchPB put_batch(&arena_);
+  auto* pair_a = put_batch.add_write_pairs();
+  pair_a->dup_key(doc_key_a.Encode().AsSlice());
+  pair_a->dup_value(packed_row_a);
+  auto* pair_b = put_batch.add_write_pairs();
+  pair_b->dup_key(doc_key_b.Encode().AsSlice());
+  pair_b->dup_value(packed_row_b);
+
+  ConsensusFrontiers frontiers;
+  ASSERT_OK(ApplyBatch(put_batch, 6000_usec_ht, 5000_usec_ht, &frontiers));
+
+  const auto smallest = Census(frontiers.Smallest());
+  const auto largest = Census(frontiers.Largest());
+
+  // The first table is censused by the mid-batch flush at the cotable transition.
+  ASSERT_EQ(smallest.count(cotable_a), 1U) << "census: " << AsString(smallest);
+  ASSERT_EQ(largest.count(cotable_a), 1U) << "census: " << AsString(largest);
+  EXPECT_EQ(smallest.at(cotable_a), kCensusSchemaVersionA);
+  EXPECT_EQ(largest.at(cotable_a), kCensusSchemaVersionA);
+
+  // The last table of the batch is not: Apply() returns without a terminal flush.
+  ASSERT_EQ(smallest.count(cotable_b), 1U)
+      << "Smallest frontier lost the last table of the batch; census: " << AsString(smallest);
+  ASSERT_EQ(largest.count(cotable_b), 1U)
+      << "Largest frontier lost the last table of the batch; census: " << AsString(largest);
+  EXPECT_EQ(smallest.at(cotable_b), kCensusSchemaVersionB);
+  EXPECT_EQ(largest.at(cotable_b), kCensusSchemaVersionB);
 }
 
 }  // namespace yb::docdb
