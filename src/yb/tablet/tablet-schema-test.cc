@@ -42,10 +42,13 @@
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
 
+#include "yb/docdb/doc_read_context.h"
+#include "yb/docdb/docdb_compaction_context.h"
 #include "yb/docdb/ql_rowwise_iterator_interface.h"
 
 #include "yb/dockv/partial_row.h"
 #include "yb/dockv/reader_projection.h"
+#include "yb/dockv/schema_packing.h"
 
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/strings/substitute.h"
@@ -59,11 +62,14 @@
 #include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/uuid.h"
 
 using std::string;
 using std::vector;
 
 using strings::Substitute;
+
+DECLARE_bool(TEST_dcheck_for_missing_schema_packing);
 
 namespace yb {
 namespace tablet {
@@ -215,6 +221,125 @@ TEST_F(TestTabletSchema, TestDeleteAndReAddColumn) {
   keys.clear();
   keys.push_back(std::pair<string, string>("{ int32_value: 1", "null }"));
   VerifyTabletRows(keys);
+}
+
+// ---------------------------------------------------------------------------
+// The repack target a compaction is handed is not pinned against schema GC.
+//
+// TableInfo::Packing(self, kLatestSchemaVersion, cutoff) (tablet_metadata.cc:440-449) clamps the
+// compaction's repack target down to SchemaPackingRegistry::MinActiveVersion() and returns it
+// inside a CompactionSchemaInfo whose only ownership edge is
+// `.schema_packing = SharedField(self, packing.get_ptr())` (tablet_metadata.cc:480) -- an
+// aliasing shared_ptr onto the CURRENT TableInfo. The registry entry a TableInfo contributes is
+// its own max_schema_version_ (SchemaPackingStorage::UpdateMaxSchemaVersion,
+// schema_packing.cc:854-856), i.e. the current version, never the clamped target. So once the
+// storage that lowered MinActiveVersion() is released, nothing records that a compaction is
+// still packing rows at the clamped target, and RaftGroupMetadata::OldSchemaGC
+// (tablet_metadata.cc:2160-2198) trims it.
+//
+// The two calls below are the two a compaction makes through SchemaPackingProvider: the target
+// is chosen once per coprefix by CotablePacking(cotable, kLatestSchemaVersion, cutoff), and every
+// row that has to be repacked resolves it again through PackedRowData::StartRepacking ->
+// CotablePacking(cotable, version, cutoff).
+TEST_F(TestTabletSchema, ClampedRepackTargetSurvivesUnrelatedSchemaGC) {
+  // In a debug build SchemaPackingStorage::GetPacking CHECK-fails on a miss while this flag is
+  // on, aborting the process before any assertion runs. Off, a lost packing surfaces as the
+  // Status a release build sees, which is the state under test.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_dcheck_for_missing_schema_packing) = false;
+
+  auto* meta = tablet()->metadata();
+  const auto base_version = meta->primary_table_schema_version();
+
+  // A long-running read holds its TableInfoPtr for the whole request
+  // (Tablet::DoHandlePgsqlReadRequest), and that is what keeps an old version "active".
+  SchemaBuilder b1(*meta->schema());
+  ASSERT_OK(b1.AddNullableColumn("c2", DataType::INT32));
+  AlterSchema(b1.Build());
+  auto pinned = meta->primary_table_info();
+  const auto pinned_version = pinned->schema_version;
+  ASSERT_EQ(pinned_version, base_version + 1);
+
+  // The table moves on while that read is still open.
+  SchemaBuilder b2(*meta->schema());
+  ASSERT_OK(b2.AddNullableColumn("c3", DataType::INT32));
+  AlterSchema(b2.Build());
+  const auto current_version = meta->primary_table_schema_version();
+  ASSERT_EQ(current_version, pinned_version + 1);
+  ASSERT_NE(pinned.get(), meta->primary_table_info().get());
+
+  // A compaction starts and picks its repack target, exactly as
+  // DocDBCompactionFeed::UpdateCoprefix does.
+  auto info = ASSERT_RESULT(TableInfo::Packing(
+      meta->primary_table_info(), docdb::kLatestSchemaVersion, HybridTime::kMax));
+
+  // Precondition: the target really was clamped below the current version by the open read.
+  // The clamp itself is intended (16c0cd4fa82: "prevent repacking into versions that are unknown
+  // to running reads"); the defect is that the clamped target is not pinned.
+  ASSERT_EQ(info.schema_version, pinned_version);
+  ASSERT_LT(info.schema_version, current_version);
+
+  // Control: at the instant the compaction was handed the target, the target resolves.
+  ASSERT_OK(meta->CotablePacking(Uuid::Nil(), info.schema_version, HybridTime::kMax));
+
+  // The read finishes. The compaction has not: it is still emitting packed rows that embed
+  // info.schema_version.
+  pinned.reset();
+
+  // Some other compaction completes. RegularRocksDbListener::OnCompactionCompleted feeds
+  // OldSchemaGC a census built from the live files' frontiers, which record only the current
+  // version -- the in-flight compaction's chosen target appears in no census.
+  ASSERT_OK(meta->OldSchemaGC({{Uuid::Nil(), current_version}}));
+
+  // Precondition: the GC ran and actually trimmed something, so a pass below cannot be vacuous.
+  // A GC that respected the in-flight target would stop at info.schema_version; either way the
+  // base version goes.
+  const auto& storage_after =
+      meta->primary_table_info()->doc_read_context->schema_packing_storage;
+  ASSERT_FALSE(storage_after.HasVersion(base_version));
+
+  // THE ASSERTION. The compaction repacks one more row and asks for its target again. Under
+  // correct behaviour the version handed out by TableInfo::Packing is still resolvable for as
+  // long as the CompactionSchemaInfo lives.
+  ASSERT_OK(meta->CotablePacking(Uuid::Nil(), info.schema_version, HybridTime::kMax));
+  ASSERT_TRUE(storage_after.HasVersion(info.schema_version));
+}
+
+// Control for the test above: with the read still open, MinActiveVersion() legitimately holds
+// the clamped target down and OldSchemaGC must not trim it. This is what the registry added by
+// 16c0cd4fa82 was built to do; it passes at the pin, so a failure above cannot be read as
+// "OldSchemaGC drops everything below the census".
+TEST_F(TestTabletSchema, ClampedRepackTargetSurvivesSchemaGcWhileReadPinHeld) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_dcheck_for_missing_schema_packing) = false;
+
+  auto* meta = tablet()->metadata();
+  const auto base_version = meta->primary_table_schema_version();
+
+  SchemaBuilder b1(*meta->schema());
+  ASSERT_OK(b1.AddNullableColumn("c2", DataType::INT32));
+  AlterSchema(b1.Build());
+  auto pinned = meta->primary_table_info();
+  const auto pinned_version = pinned->schema_version;
+  ASSERT_EQ(pinned_version, base_version + 1);
+
+  SchemaBuilder b2(*meta->schema());
+  ASSERT_OK(b2.AddNullableColumn("c3", DataType::INT32));
+  AlterSchema(b2.Build());
+  const auto current_version = meta->primary_table_schema_version();
+  ASSERT_EQ(current_version, pinned_version + 1);
+
+  auto info = ASSERT_RESULT(TableInfo::Packing(
+      meta->primary_table_info(), docdb::kLatestSchemaVersion, HybridTime::kMax));
+  ASSERT_EQ(info.schema_version, pinned_version);
+
+  // Same GC, same census -- the only difference from the test above is that the pin is still
+  // held here.
+  ASSERT_OK(meta->OldSchemaGC({{Uuid::Nil(), current_version}}));
+
+  const auto& storage_after =
+      meta->primary_table_info()->doc_read_context->schema_packing_storage;
+  ASSERT_FALSE(storage_after.HasVersion(base_version));
+  ASSERT_TRUE(storage_after.HasVersion(info.schema_version));
+  ASSERT_OK(meta->CotablePacking(Uuid::Nil(), info.schema_version, HybridTime::kMax));
 }
 
 } // namespace tablet
