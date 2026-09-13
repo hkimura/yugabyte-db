@@ -23,6 +23,7 @@
 using namespace std::literals;
 
 DECLARE_bool(enable_global_load_balancing);
+DECLARE_bool(ycql_enable_packed_row);
 DECLARE_bool(TEST_invalidate_last_change_metadata_op);
 DECLARE_bool(TEST_keep_intent_doc_ht);
 DECLARE_int32(remote_bootstrap_begin_session_timeout_ms);
@@ -407,6 +408,73 @@ TEST_F(CqlPackedRowTest, RemoteBootstrap) {
 
 TEST_F(CqlPackedRowTest, RemoteBootstrapWithNewChangeMetadataReplayLogic) {
   TestRemoteBootstrap();
+}
+
+// Repro for the TTL twin of #33479: a full compaction drops a TTL-expired column delta that it
+// never merged into the packed row underneath it, and the pre-update value is resurrected.
+//
+// The kTombstone branch of DocDBCompactionFeed::Feed got a packed-row guard in 1d650612a16
+// ("[#33479] Do not GC a column tombstone that was not merged into its packed row"). The
+// has_expired branch a few dozen lines below it did not, even though a YCQL expiry is a delete and
+// therefore carries exactly the same content. After the packed-row ON->OFF toggle the fold gate
+// (PackedRowData::can_start_packing()) is false, so the expired delta is never merged -- and is
+// then dropped unconditionally, exactly like the tombstone used to be.
+TEST_F(CqlPackedRowTest, TtlExpiredColumnOverUnmergedPackedRow) {
+  const auto kTtl = 2 * kTimeMultiplier;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, value TEXT) WITH tablets = 1"));
+
+  // Written while packing is on, so this is a packed row on disk.
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, value) VALUES (1, 'one')"));
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 1));
+
+  ASSERT_OK(session.ExecuteQueryFormat(
+      "UPDATE t USING TTL $0 SET value = 'dva' WHERE key = 1", kTtl));
+  ASSERT_OK(cluster_->FlushTablets());
+  ASSERT_NO_FATALS(CheckNumRecords(cluster_.get(), 2));
+
+  // Expiry is a delete: once the delta expires the column reads as absent.
+  std::this_thread::sleep_for(1s * kTtl + 1s * kTimeMultiplier);
+  ASSERT_OK(CheckTableContent(&session, "1,NULL", "key = 1"));
+
+  // The ON->OFF toggle. New writes stop being packed and, more to the point, the compaction below
+  // can no longer fold the expired delta into the packed row it shadows.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_enable_packed_row) = false;
+  ASSERT_OK(cluster_->CompactTablets());
+
+  // The delete must survive the compaction.
+  ASSERT_OK(CheckTableContent(&session, "1,NULL", "key = 1"));
+}
+
+// Control for the test above: with packing left enabled at compaction time the expired delta is
+// folded into the packed row, so the expiry survives on every build. Keeping both makes the
+// packed-row flag state at compaction time the only difference between a passing and a failing
+// run.
+TEST_F(CqlPackedRowTest, TtlExpiredColumnOverMergedPackedRow) {
+  const auto kTtl = 2 * kTimeMultiplier;
+
+  auto session = ASSERT_RESULT(EstablishSession(driver_.get()));
+
+  ASSERT_OK(session.ExecuteQuery(
+      "CREATE TABLE t (key INT PRIMARY KEY, value TEXT) WITH tablets = 1"));
+
+  ASSERT_OK(session.ExecuteQuery("INSERT INTO t (key, value) VALUES (1, 'one')"));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  ASSERT_OK(session.ExecuteQueryFormat(
+      "UPDATE t USING TTL $0 SET value = 'dva' WHERE key = 1", kTtl));
+  ASSERT_OK(cluster_->FlushTablets());
+
+  std::this_thread::sleep_for(1s * kTtl + 1s * kTimeMultiplier);
+  ASSERT_OK(CheckTableContent(&session, "1,NULL", "key = 1"));
+
+  ASSERT_OK(cluster_->CompactTablets());
+
+  ASSERT_OK(CheckTableContent(&session, "1,NULL", "key = 1"));
 }
 
 } // namespace yb
