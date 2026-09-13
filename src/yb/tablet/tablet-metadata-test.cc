@@ -44,6 +44,12 @@
 
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/docdb/doc_read_context.h"
+
+#include "yb/dockv/schema_packing.h"
+
+#include "yb/qlexpr/index.h"
+
 #include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/operations/snapshot_operation.h"
 #include "yb/tablet/tablet-test-harness.h"
@@ -59,6 +65,8 @@
 #include "yb/util/status_log.h"
 
 using std::string;
+
+DECLARE_bool(TEST_dcheck_for_missing_schema_packing);
 
 namespace yb {
 namespace tablet {
@@ -611,6 +619,236 @@ TEST_F(TestRaftGroupMetadata, LoadFromPathDoesNotMigrateOrFlushOldSuperblock) {
 
   ASSERT_EQ(loaded_colocated.size(), 1u);
   ASSERT_EQ(loaded_colocated[0]->schema().colocation_id(), kColocationId);
+}
+
+// ---------------------------------------------------------------------------
+// A YCQL out-of-cluster restore can rebind the tablet's CURRENT schema version to the snapshot's
+// packing, and the binding does not even survive a superblock round trip.
+//
+// Export side: RepackSnapshotsForBackup repairs the skew between the snapshotted
+// SysTablesEntryPB.version (frozen when the master collected entries) and the schema version the
+// tablets later reached because an ALTER raced CREATE_ON_TABLET. That repair
+// (src/yb/master/catalog_manager_ext.cc:744-765) sits INSIDE
+// `if (l->table_type() == PGSQL_TABLE_TYPE && !IsColocationParentTableId(entry.id()))` (:695), so
+// it never runs for a YCQL (YQL_TABLE_TYPE) table.
+//
+// Import side: ImportTableEntry recreates the table from the snapshot entry's (pre-ALTER) schema
+// and then, for a YCQL main table, takes `else if (meta.version() >= table->...pb.version())
+// schema_version = meta.version() + 1` (:2569-2578) -- the YCQL arm above it (:2559-2560) only
+// carves out CQL *index* tables. With the unrepaired meta.version() = N, the restore side's
+// current version becomes N+1, which is exactly the version the snapshot's own tablet superblock
+// carries.
+//
+// Restore side: a non-schedule restore merges with OverwriteSchemaPacking::kTrue
+// (tablet_snapshots.cc, `is_pitr_restore = !request.schedule_id().empty()`), and
+// SchemaPackingStorage::GetMergedSchemaPackings (dockv/schema_packing.cc:939-960) then does
+// `new_packings.erase(schema_version)` followed by `AddSchema(table_type_, schema_version,
+// temp_schema /* = pb.schema() */)`. With the skew, `schema_version` is the restore side's
+// CURRENT version, so the packing the master just committed for the restored table is erased and
+// replaced by the source's post-ALTER packing.
+//
+// The detector is TableInfo::MergeSchemaPackings' second guard
+// (src/yb/tablet/tablet_metadata.cc:396-402): LOG_IF(DFATAL, !SchemaContainsPacking(...)) followed
+// by `return Status::OK()`. DFATAL is LOG(ERROR) in release (util/logging.h:167-171), so the
+// restore reports success. The tests below therefore call DocReadContext::MergeWithRestored -- the
+// single line TableInfo::MergeSchemaPackings delegates to at tablet_metadata.cc:387 -- so that a
+// fastdebug binary observes the release-build outcome instead of aborting on the detector.
+//
+// What these tests demonstrate is the destructive half (the merge). The master-side scoping half
+// is not exercised here; see the commit message.
+namespace {
+
+// The TableInfoPB a snapshot superblock carries for a source tablet that started at
+// `old_schema` (version 0) and advanced to `new_schema` at `new_version` -- i.e. what
+// TabletSnapshots::Create writes via metadata()->SaveTo(TabletMetadataFile(snapshot_dir)).
+// TableInfo::ToPB -> DocReadContext::ToPB skips the CURRENT version's packing, so the result is
+// schema_version = new_version, schema = new_schema, old_schema_packings = {0: old_schema}.
+TableInfoPB MakeSnapshotSuperblockTableInfo(
+    const Schema& old_schema, const Schema& new_schema, SchemaVersion new_version) {
+  auto partition = CreateDefaultPartition(old_schema);
+  auto source_v0 = TableInfo::TEST_Create(
+      "snapshot_src", "test_ns", "snapshot_src", YQL_TABLE_TYPE, old_schema, partition.first);
+  auto source_vn = std::make_shared<TableInfo>(
+      *source_v0, new_schema, qlexpr::IndexMap(), std::vector<DeletedColumn>(), new_version);
+  TableInfoPB pb;
+  source_vn->ToPB(&pb);
+  return pb;
+}
+
+}  // namespace
+
+class YcqlRestoreSchemaSkewTest : public TestRaftGroupMetadata {
+ public:
+  void SetUp() override {
+    // A packing-registry miss CHECK-fails in a debug build while this is on. Off, it surfaces as
+    // the Status a release build sees.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_dcheck_for_missing_schema_packing) = false;
+    TestRaftGroupMetadata::SetUp();
+  }
+
+ protected:
+  static constexpr SchemaVersion kSourceAlteredVersion = 1;
+
+  // Sets up the restore-side tablet at `restore_side_version` with the pre-ALTER schema (what
+  // RecreateTable + SendAlterTableRequest leave behind) and returns the snapshot superblock's
+  // TableInfoPB for a source tablet that dropped a column at version kSourceAlteredVersion.
+  //
+  // restore_side_version == kSourceAlteredVersion is the unrepaired YCQL case: the master's
+  // frozen SysTablesEntryPB.version was 0, so ImportTableEntry bumped to 0 + 1 = 1, colliding
+  // with the version the source tablet reached.
+  // restore_side_version == kSourceAlteredVersion + 1 is what the YSQL repair produces: the
+  // exported version was raised to 1, so the bump lands at 2 and nothing collides.
+  TableInfoPB PrepareRestoreSide(SchemaVersion restore_side_version) {
+    auto* meta = harness_->tablet()->metadata();
+    const Schema pre_alter = *meta->schema();
+    SchemaBuilder builder(pre_alter);
+    CHECK_OK(builder.RemoveColumn("int_val"));
+    post_alter_schema_ = builder.Build();
+    CHECK(!post_alter_schema_.Equals(pre_alter));
+
+    auto snapshot_pb =
+        MakeSnapshotSuperblockTableInfo(pre_alter, post_alter_schema_, kSourceAlteredVersion);
+    CHECK_EQ(snapshot_pb.schema_version(), kSourceAlteredVersion);
+
+    meta->SetSchema(
+        pre_alter, qlexpr::IndexMap(), /* deleted_cols = */ {}, restore_side_version, OpId());
+    return snapshot_pb;
+  }
+
+  static std::string PackingAt(const TableInfoPtr& table_info, SchemaVersion version) {
+    auto packing = table_info->doc_read_context->schema_packing_storage.GetPacking(version);
+    return packing.ok() ? packing->ToString() : packing.status().ToString();
+  }
+
+  Schema post_alter_schema_;
+};
+
+// The destructive half: the merge must not leave the tablet's current schema version bound to a
+// packing that does not describe the tablet's current schema.
+TEST_F(YcqlRestoreSchemaSkewTest, MergeDoesNotRebindCurrentSchemaVersion) {
+  const auto snapshot_pb = PrepareRestoreSide(kSourceAlteredVersion);
+  auto* meta = harness_->tablet()->metadata();
+  auto table_info = meta->primary_table_info();
+  auto& storage = table_info->doc_read_context->schema_packing_storage;
+
+  // Preconditions.
+  // (a) The skew: the snapshot superblock names the same schema version the restore side is
+  //     currently committed at. This is what makes GetMergedSchemaPackings' erase+re-add land on
+  //     the live version.
+  ASSERT_EQ(table_info->schema_version, kSourceAlteredVersion);
+  ASSERT_EQ(table_info->schema_version, snapshot_pb.schema_version());
+  // (b) The two schemas really differ, so a rebind is observable at all.
+  Schema snapshot_schema;
+  ASSERT_OK(SchemaFromPB(snapshot_pb.schema(), &snapshot_schema));
+  ASSERT_FALSE(snapshot_schema.Equals(table_info->schema()));
+  // (c) Before the merge the binding is sound: version N+1 describes the live schema.
+  {
+    const dockv::SchemaPacking& before =
+        ASSERT_RESULT(storage.GetPacking(table_info->schema_version));
+    ASSERT_TRUE(before.SchemaContainsPacking(YQL_TABLE_TYPE, table_info->schema()));
+  }
+  // (d) The first of MergeSchemaPackings' two DFATAL guards, `schema_version < pb.schema_version()`
+  //     (tablet_metadata.cc:381-385), does not fire here: the versions are equal. Only the second
+  //     one does, and it is fail-open.
+  ASSERT_FALSE(table_info->schema_version < snapshot_pb.schema_version());
+
+  const auto merge_status = table_info->doc_read_context->MergeWithRestored(
+      snapshot_pb, dockv::OverwriteSchemaPacking::kTrue);
+  LOG(INFO) << "MergeWithRestored returned: " << merge_status;
+
+  // THE ASSERTION. Correct behaviour has two acceptable shapes: the merge refuses an input that
+  // would redefine the tablet's current schema version, or it leaves that version still
+  // describing the live schema. What must not happen -- and what happens at the pin -- is
+  // Status::OK() plus a redefined version, which is exactly the state
+  // TableInfo::MergeSchemaPackings' own DFATAL declares invalid and then lets through.
+  if (merge_status.ok()) {
+    const dockv::SchemaPacking& merged =
+        ASSERT_RESULT(storage.GetPacking(table_info->schema_version));
+    ASSERT_TRUE(merged.SchemaContainsPacking(YQL_TABLE_TYPE, table_info->schema()))
+        << "schema version " << table_info->schema_version << " was rebound to "
+        << merged.ToString() << " while the tablet's live schema is "
+        << table_info->schema().ToString();
+  }
+}
+
+// The persistence half: whatever the merge binds to the current schema version must survive a
+// superblock round trip. TableInfo::ToPB -> DocReadContext::ToPB skips the current version's
+// packing (schema_packing.cc ToPB, `skip_schema_version`), and DocReadContext::LoadFromPB
+// regenerates it with AddSchema(pb.schema_version(), schema_) from the LIVE schema -- so a
+// rebound version silently means one thing before the next tablet open and another after it.
+TEST_F(YcqlRestoreSchemaSkewTest, MergedCurrentVersionPackingSurvivesSuperblockRoundTrip) {
+  const auto snapshot_pb = PrepareRestoreSide(kSourceAlteredVersion);
+  auto* meta = harness_->tablet()->metadata();
+  const auto current_version = meta->primary_table_info()->schema_version;
+  ASSERT_EQ(current_version, snapshot_pb.schema_version());
+
+  const auto merge_status = meta->primary_table_info()->doc_read_context->MergeWithRestored(
+      snapshot_pb, dockv::OverwriteSchemaPacking::kTrue);
+  LOG(INFO) << "MergeWithRestored returned: " << merge_status;
+
+  const auto before_reload = PackingAt(meta->primary_table_info(), current_version);
+
+  // The tablet is shut down first for the same reason TestLoadFromSuperBlock does it: the
+  // round trip replaces the metadata's live TableInfo objects.
+  writer_.reset();
+  harness_->tablet()->StartShutdown(DisableFlushOnShutdown::kFalse, AbortOps::kFalse);
+  harness_->tablet()->CompleteShutdown();
+
+  RaftGroupReplicaSuperBlockPB superblock;
+  meta->ToSuperBlock(&superblock);
+  ASSERT_OK(meta->ReplaceSuperBlock(superblock));
+
+  const auto after_reload = PackingAt(meta->primary_table_info(), current_version);
+
+  // THE ASSERTION.
+  ASSERT_EQ(before_reload, after_reload);
+}
+
+// Control: the geometry the YSQL export-side repair produces. RepackSnapshotsForBackup raises the
+// exported SysTablesEntryPB.version to the master's current version, so ImportTableEntry's
+// meta.version() + 1 lands one above every version in the snapshot and nothing collides. Passes
+// at the pin, and shows the merge machinery is doing real work rather than no-oping: the
+// snapshot's own packing for its version is installed, the live version is untouched, and the
+// binding survives the round trip.
+TEST_F(YcqlRestoreSchemaSkewTest, RepairedSnapshotVersionLeavesCurrentPackingIntact) {
+  const auto snapshot_pb = PrepareRestoreSide(kSourceAlteredVersion + 1);
+  auto* meta = harness_->tablet()->metadata();
+  auto table_info = meta->primary_table_info();
+  auto& storage = table_info->doc_read_context->schema_packing_storage;
+  const auto current_version = table_info->schema_version;
+
+  ASSERT_EQ(current_version, kSourceAlteredVersion + 1);
+  ASSERT_GT(current_version, snapshot_pb.schema_version());
+  ASSERT_FALSE(storage.HasVersion(snapshot_pb.schema_version()));
+
+  ASSERT_OK(table_info->doc_read_context->MergeWithRestored(
+      snapshot_pb, dockv::OverwriteSchemaPacking::kTrue));
+
+  // The merge really ran: the snapshot's post-ALTER packing is now present at its own version.
+  ASSERT_TRUE(storage.HasVersion(snapshot_pb.schema_version()));
+  {
+    const dockv::SchemaPacking& snapshot_packing =
+        ASSERT_RESULT(storage.GetPacking(snapshot_pb.schema_version()));
+    ASSERT_TRUE(snapshot_packing.SchemaContainsPacking(YQL_TABLE_TYPE, post_alter_schema_));
+  }
+
+  // And the live version still describes the live schema.
+  {
+    const dockv::SchemaPacking& merged = ASSERT_RESULT(storage.GetPacking(current_version));
+    ASSERT_TRUE(merged.SchemaContainsPacking(YQL_TABLE_TYPE, table_info->schema()));
+  }
+
+  const auto before_reload = PackingAt(meta->primary_table_info(), current_version);
+
+  writer_.reset();
+  harness_->tablet()->StartShutdown(DisableFlushOnShutdown::kFalse, AbortOps::kFalse);
+  harness_->tablet()->CompleteShutdown();
+
+  RaftGroupReplicaSuperBlockPB superblock;
+  meta->ToSuperBlock(&superblock);
+  ASSERT_OK(meta->ReplaceSuperBlock(superblock));
+
+  ASSERT_EQ(before_reload, PackingAt(meta->primary_table_info(), current_version));
 }
 
 } // namespace tablet
