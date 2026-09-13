@@ -84,6 +84,11 @@ DEFINE_test_flag(bool, pause_after_tombstoning_snapshot, false,
     "If true, pause snapshot deletion after tombstoning the snapshot directory "
     "until the flag is reset.");
 
+DEFINE_test_flag(bool, fail_restore_after_frontier_patch, false,
+    "If true, RestoreCheckpoint fails right after the restored files' flushed frontier has been "
+    "durably patched and before the restored metadata is flushed, reproducing the on-disk state "
+    "an ungraceful stop leaves in that window.");
+
 METRIC_DEFINE_counter(
     tablet, snapshot_tombstone_successes, "Snapshot Tombstone Successes",
     yb::MetricUnit::kOperations,
@@ -750,6 +755,10 @@ Status TabletSnapshots::RestoreCheckpoint(
     if (restore_at) {
       RETURN_NOT_OK(patcher.SetHybridTimeFilter(std::nullopt, restore_at));
     }
+  }
+
+  if (PREDICT_FALSE(FLAGS_TEST_fail_restore_after_frontier_patch)) {
+    return STATUS(RuntimeError, "TEST: simulated crash after the flushed frontier patch");
   }
 
   bool need_flush = false;

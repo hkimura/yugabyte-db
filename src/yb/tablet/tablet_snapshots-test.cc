@@ -19,12 +19,19 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_protocol_util.h"
 #include "yb/common/wire_protocol-test-util.h"
+
+#include "yb/docdb/doc_read_context.h"
+
+#include "yb/dockv/schema_packing.h"
 
 #include "yb/rpc/messenger.h"
 
+#include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/operations/snapshot_operation.h"
 #include "yb/tablet/tablet-test-harness.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet-test-util.h"
 #include "yb/tablet/tablet.h"
 #include "yb/tablet/tablet_metadata.h"
@@ -43,6 +50,10 @@
 
 DECLARE_bool(enable_async_snapshot_directory_cleanup);
 DECLARE_int32(TEST_snapshot_cleanup_retry_delay_ms);
+DECLARE_bool(TEST_fail_restore_after_frontier_patch);
+DECLARE_bool(TEST_dcheck_for_missing_schema_packing);
+DECLARE_bool(ycql_enable_packed_row);
+DECLARE_bool(enable_schema_packing_gc);
 
 METRIC_DECLARE_counter(snapshot_cleanup_failures);
 METRIC_DECLARE_counter(snapshot_cleanup_retries);
@@ -566,6 +577,215 @@ TEST_F(TabletSnapshotsTest, ShutdownWaitsForRunningCleanup) {
   shutdown_thread.JoinAll();
   ASSERT_TRUE(shutdown_complete.load(std::memory_order_acquire));
   ASSERT_FALSE(test_env_->FileExists(paths.tombstone));
+}
+
+// ---------------------------------------------------------------------------
+// Restore makes the snapshot's data and the "the restore op is flushed" claim durable BEFORE the
+// packing metadata those rows need.
+//
+// TabletSnapshots::RestoreCheckpoint (tablet_snapshots.cc:702-833, line numbers as committed
+// here, i.e. including the four-line TEST_ hook), in order:
+//   :725-739  CompleteShutdownStorages + DeleteRecursively of the live storage paths, then
+//             CopyDirectory(snapshot_dir -> db_dir, kUseHardLinks) + MoveChildren. The snapshot's
+//             SSTs are now the tablet's live data on disk.
+//   :750-756  RocksDBPatcher::ModifyFlushedFrontier(frontier, ...) with the restore op's id
+//             (TabletSnapshots::Restore sets frontier.set_op_id(operation->op_id()), :575).
+//             The patcher applies it through VersionSet::LogAndApply -- RocksDB's durable,
+//             synced MANIFEST write -- in kForce mode (docdb_rocksdb_util.cc,
+//             RocksDBPatcher::ModifyFlushedFrontier). After this line the on-disk claim is
+//             "the restore op is flushed into the regular DB".
+//   :764-799  the metadata half, all in memory: SetSchema for the primary and each colocated
+//             table, and MergeWithRestored -- the only path by which the snapshot superblock's
+//             old_schema_packings re-enter the registry.
+//   :804-806  metadata()->Flush() -- the first durable write of the restored packings.
+//
+// An ungraceful stop inside [frontier patched, superblock flushed] leaves the snapshot's packed
+// rows durably installed next to the pre-restore packing registry. Nothing re-runs the metadata
+// half: TabletBootstrap reads flushed_op_ids from Tablet::MaxPersistentOpId, and
+// ShouldReplayOperation's fall-through for SNAPSHOT_OP is
+// `return {index > flushed_op_ids.regular.index}`, which the patched frontier has just made
+// false.
+//
+// The test drives that window with a default-off TEST_ hook placed immediately after the patcher
+// scope, then reopens the tablet. The assertion is that the reopened replica can read its data.
+class TabletRestoreDurabilityTest : public YBTabletTest {
+ public:
+  TabletRestoreDurabilityTest() : YBTabletTest(CreateBaseSchema(), YQL_TABLE_TYPE) {}
+
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_enable_packed_row) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_schema_packing_gc) = true;
+    // A packing-registry miss CHECK-fails in a debug build while this is on, aborting the process
+    // before any assertion runs. Off, it surfaces as the Status a release build sees.
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_dcheck_for_missing_schema_packing) = false;
+    YBTabletTest::SetUp();
+  }
+
+  void TearDown() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_restore_after_frontier_patch) = false;
+    YBTabletTest::TearDown();
+  }
+
+  void InsertRowInto(const TabletPtr& target, int32_t key, int32_t value) {
+    LocalTabletWriter writer(target);
+    QLWriteRequestPB req;
+    QLAddInt32HashValue(&req, key);
+    QLAddInt32ColumnValue(&req, kFirstColumnId + 1, value);
+    ASSERT_OK(writer.Write(&req));
+  }
+
+  void InsertRow(int32_t key, int32_t value) {
+    ASSERT_NO_FATALS(InsertRowInto(tablet(), key, value));
+  }
+
+  Status CreateTabletSnapshot(const std::string& snapshot_id, int64_t op_index) {
+    tserver::TabletSnapshotOpRequestPB request;
+    request.set_operation(tserver::TabletSnapshotOpRequestPB::CREATE_ON_TABLET);
+    request.set_snapshot_id(snapshot_id);
+    SnapshotOperation operation(tablet());
+    operation.AllocateRequest()->CopyFrom(request);
+    operation.set_hybrid_time(clock()->Now());
+    operation.set_op_id(OpId(1, op_index));
+    return tablet()->snapshots().Create(&operation);
+  }
+
+  Status RestoreTabletSnapshot(const std::string& snapshot_id, int64_t op_index) {
+    tserver::TabletSnapshotOpRequestPB request;
+    request.set_operation(tserver::TabletSnapshotOpRequestPB::RESTORE_ON_TABLET);
+    request.set_snapshot_id(snapshot_id);
+    SnapshotOperation operation(tablet());
+    operation.AllocateRequest()->CopyFrom(request);
+    operation.set_hybrid_time(clock()->Now());
+    operation.set_op_id(OpId(1, op_index));
+    return tablet()->snapshots().Restore(&operation);
+  }
+
+  void ShutdownTablet() {
+    tablet()->StartShutdown(DisableFlushOnShutdown::kFalse, AbortOps::kFalse);
+    tablet()->CompleteShutdown();
+  }
+
+  // Brings the tablet back up on the same on-disk state, the way a tserver restart does.
+  //
+  // YBTabletTest::TabletReOpen cannot be used as-is: it rebuilds the harness with the fixture's
+  // ORIGINAL schema, and RaftGroupMetadata::TEST_LoadOrCreate rejects a superblock whose schema
+  // differs (tablet_metadata.cc:921-926), while this scenario alters the schema on purpose. So
+  // rebuild the harness with the schema that is actually on disk. The new harness's logical clock
+  // restarts at kInitial and the fresh MvccManager only advances with traffic, so the clock is
+  // restored and one sentinel row is written; safe time then covers everything written before the
+  // shutdown -- same reason and shape as
+  // TestRaftGroupMetadata.MovedRocksDbDirReopensEmptyWithoutComplaint.
+  void ShutdownAndReOpen(int32_t sentinel_key) {
+    const Schema on_disk_schema = *tablet()->metadata()->schema();
+    const auto pre_shutdown_ht = clock()->Now();
+    ShutdownTablet();
+
+    TabletTestHarness::Options options(GetTestPath("fs_root"));
+    options.enable_metrics = true;
+    options.table_type = YQL_TABLE_TYPE;
+    // reset() destroys the previous harness (and its Tablet) before Create() builds the new one.
+    harness_.reset(new TabletTestHarness(on_disk_schema, std::move(options)));
+    ASSERT_OK(harness_->Create(/* first_time = */ false));
+    ASSERT_OK(harness_->Open());
+
+    clock()->Update(pre_shutdown_ht);
+    ASSERT_NO_FATALS(InsertRow(sentinel_key, sentinel_key));
+  }
+
+  // Builds the state under test: rows packed at the snapshot's schema version
+  // in a snapshot whose packing the live registry has since GC'd away.
+  void BuildSnapshotWithSinceGcdPacking(
+      const std::string& snapshot_id, SchemaVersion* snapshot_version) {
+    ASSERT_NO_FATALS(InsertRow(1, 100));
+    ASSERT_NO_FATALS(InsertRow(2, 200));
+    ASSERT_OK(tablet()->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
+
+    auto* meta = tablet()->metadata();
+    *snapshot_version = meta->primary_table_schema_version();
+    ASSERT_OK(CreateTabletSnapshot(snapshot_id, 10));
+
+    // The table moves on and a compaction lets RegularRocksDbListener::OnCompactionCompleted run
+    // OldSchemaGC, trimming the packing the snapshot's rows need. This is the state the existing
+    // regression test PgPackedRowTest.RestorePITRSnapshotAfterOldSchemaGC constructs on purpose,
+    // and the state every cross-cluster restore starts from.
+    SchemaBuilder builder(*meta->schema());
+    ASSERT_OK(builder.AddNullableColumn("c2", DataType::INT32));
+    AlterSchema(builder.Build());
+    ASSERT_NO_FATALS(InsertRow(3, 300));
+    ASSERT_OK(tablet()->Flush(FlushMode::kSync, rocksdb::FlushReason::kTestOnly));
+    ASSERT_OK(tablet()->ForceManualRocksDBCompact());
+
+    ASSERT_GT(meta->primary_table_schema_version(), *snapshot_version);
+    // Precondition: the live registry no longer holds the snapshot's packing, so the restored
+    // rows are decodable only through the merge RestoreCheckpoint performs.
+    ASSERT_FALSE(meta->primary_table_info()->doc_read_context->schema_packing_storage
+                     .HasVersion(*snapshot_version));
+  }
+
+ private:
+  static Schema CreateBaseSchema() {
+    return Schema({ ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+                    ColumnSchema("c1", DataType::INT32) });
+  }
+};
+
+// Control: the same geometry with the restore allowed to finish. Passes at the pin; it proves
+// the harness really does install the snapshot's rows and really does make them readable when
+// the metadata half runs, so the failure below is about the crash window and not about the
+// scenario being unbuildable.
+TEST_F(TabletRestoreDurabilityTest, RestoredRowsReadableAfterCompleteRestore) {
+  const std::string kSnapshotId = "0123456789ABCDEF0123456789ABCDEF";
+  constexpr int64_t kRestoreOpIndex = 30;
+
+  SchemaVersion snapshot_version = 0;
+  ASSERT_NO_FATALS(BuildSnapshotWithSinceGcdPacking(kSnapshotId, &snapshot_version));
+
+  ASSERT_OK(RestoreTabletSnapshot(kSnapshotId, kRestoreOpIndex));
+
+  // The merge put the snapshot's packing back.
+  ASSERT_TRUE(tablet()->metadata()->primary_table_info()->doc_read_context->schema_packing_storage
+                  .HasVersion(snapshot_version));
+
+  ASSERT_NO_FATALS(ShutdownAndReOpen(/* sentinel_key = */ 100));
+
+  std::vector<std::string> rows;
+  ASSERT_OK(DumpTablet(*tablet(), &rows));
+  // The two snapshot rows plus the sentinel; row 3 was written after the snapshot and is gone.
+  ASSERT_EQ(rows.size(), 3);
+}
+
+TEST_F(TabletRestoreDurabilityTest, RestoredRowsReadableAfterCrashInMetadataWindow) {
+  const std::string kSnapshotId = "0123456789ABCDEF0123456789ABCDEF";
+  constexpr int64_t kRestoreOpIndex = 30;
+
+  SchemaVersion snapshot_version = 0;
+  ASSERT_NO_FATALS(BuildSnapshotWithSinceGcdPacking(kSnapshotId, &snapshot_version));
+
+  // The replica stops ungracefully after the flushed frontier has been patched to the restore
+  // op's id and before metadata()->Flush().
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_restore_after_frontier_patch) = true;
+  const auto restore_status = RestoreTabletSnapshot(kSnapshotId, kRestoreOpIndex);
+  ASSERT_NOK(restore_status);
+  ASSERT_STR_CONTAINS(restore_status.ToString(), "simulated crash");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_restore_after_frontier_patch) = false;
+
+  ASSERT_NO_FATALS(ShutdownAndReOpen(/* sentinel_key = */ 100));
+
+  // Precondition: the snapshot's files really are the tablet's live data now -- this is not an
+  // empty tablet, and the assertion below is not vacuous.
+  ASSERT_FALSE(tablet()->regular_db()->GetLiveFilesMetaData().empty());
+
+  // Precondition: the restore op is durably recorded as flushed into the regular DB, so
+  // TabletBootstrap::ShouldReplayOperation's fall-through
+  // (`return {index > flushed_op_ids.regular.index}`) is false for it. Nothing will re-run the
+  // metadata half that did not happen.
+  const auto flushed = ASSERT_RESULT(tablet()->MaxPersistentOpId());
+  ASSERT_GE(flushed.regular.index, kRestoreOpIndex);
+
+  // THE ASSERTION: the reopened replica can read the data it durably installed.
+  std::vector<std::string> rows;
+  ASSERT_OK(DumpTablet(*tablet(), &rows));
+  ASSERT_EQ(rows.size(), 3);
 }
 
 }  // namespace
