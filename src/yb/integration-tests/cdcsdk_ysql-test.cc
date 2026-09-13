@@ -4895,6 +4895,120 @@ TEST_F(
   CDCSDKAlterWithSysCatalogCompaction(true);
 }
 
+// CDC resolves the schema for a record by time-travelling the master sys catalog to the record's
+// own hybrid time. When that read fails, GetOrPopulateRequiredSchemaDetails
+// (cdc/cdcsdk_producer.cc:817-830) does not surface the failure: it installs the tablet's CURRENT
+// schema and schema version in cached_schema_details, and FillDDLInfo (:837) sits outside that
+// if/else, so the failure branch also announces the current schema to a consumer that is still
+// replaying pre-ALTER rows. DoPopulatePackedRows (:663-672) then decodes the row with its own
+// (correct) packing while naming every column through that substituted schema.
+//
+// Geometry, on top of CDCSDKAlterWithSysCatalogCompaction's (400 rows over four schema eras, one
+// of the DDLs being a DROP COLUMN whose column id is later reused by a re-ADD):
+//   - timestamp_syscatalog_history_retention_interval_sec = 0 and cdc_enable_dynamic_schema_changes
+//     = false leave AllowedHistoryCutoffProvider (master/catalog_manager_ext.cc:3849-3856)
+//     unclamped, so the master force-compaction really does collapse the historical
+//     SysTablesEntryPB versions rather than keeping them for the default 4 h;
+//   - one GetChanges before any row is written drains the tablet's bootstrap CHANGE_METADATA_OP,
+//     which is what primes cached_schema_details with the correct initial schema on a from-scratch
+//     replay. A consumer resuming from its own persisted checkpoint mid-stream does not see it;
+//   - replaying a second time from that same checkpoint makes from_op_id differ from the last
+//     streamed op id, so cdc_service.cc:1904-1911 drops cached_schema_details and every record's
+//     schema has to be resolved from the (now compacted) sys catalog again.
+//
+// Under correct behaviour a record is described by the schema that was current at that record's
+// own hybrid time, so the per-era column counts (3/4/3/5) and the initial era's column names hold.
+TEST_F(
+    CDCSDKYsqlTest,
+    YB_DISABLE_TEST_IN_TSAN(TestCDCSDKSchemaLookupFailsOpenAfterSysCatalogCompaction)) {
+  ASSERT_OK(SET_FLAG(ysql_enable_packed_row, true));
+  ASSERT_OK(SetUpWithParams(1 /* num_tservers */, 1 /* num_masters */, false /* colocated */));
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_history_retention_interval_sec) = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_level0_file_num_compaction_trigger) = 0;
+  // Same as the existing CDCSDKAlterWithSysCatalogCompaction helper: with this AutoFlag on,
+  // CDCMasterBgTask publishes cdc_sdk_safe_time on the sys-catalog tablet and
+  // AllowedHistoryCutoffProvider clamps the cutoff to it, which holds the catalog history the
+  // stream needs. Turning it off models a cluster where that barrier is not maintained.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_enable_dynamic_schema_changes) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_timestamp_syscatalog_history_retention_interval_sec) = 0;
+
+  const uint32_t num_tablets = 1;
+  auto table = ASSERT_RESULT(CreateTable(
+      &test_cluster_, test_namespace_name, kTableName, num_tablets, true, false, 0, false, "",
+      "public", 3, {kValue2ColumnName}));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, /* partition_list_version =*/nullptr));
+  ASSERT_EQ(tablets.size(), num_tablets);
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(test_namespace_name));
+
+  xrepl::StreamId stream_id = ASSERT_RESULT(CreateDBStream(IMPLICIT));
+  auto set_resp = ASSERT_RESULT(SetCDCCheckpoint(stream_id, tablets));
+  ASSERT_FALSE(set_resp.has_error());
+
+  // Drain the bootstrap CHANGE_METADATA_OP so that replay_from sits after it.
+  auto bootstrap_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets));
+  const CDCSDKCheckpointPB replay_from = bootstrap_resp.cdc_sdk_checkpoint();
+  // Precondition: the replay position really is past the start of the WAL, otherwise the second
+  // replay below would re-read the bootstrap CHANGE_METADATA_OP and re-prime the schema cache.
+  ASSERT_GT(replay_from.index(), 0);
+
+  ASSERT_OK(WriteRows(1 /* start */, 101 /* end */, &test_cluster_, {kValue2ColumnName}));
+  ASSERT_OK(AddColumn(&test_cluster_, test_namespace_name, kTableName, kValue3ColumnName, &conn));
+  ASSERT_OK(WriteRows(
+      101 /* start */, 201 /* end */, &test_cluster_, {kValue2ColumnName, kValue3ColumnName}));
+  ASSERT_OK(DropColumn(&test_cluster_, test_namespace_name, kTableName, kValue2ColumnName, &conn));
+  ASSERT_OK(WriteRows(201 /* start */, 301 /* end */, &test_cluster_, {kValue3ColumnName}));
+  ASSERT_OK(AddColumn(&test_cluster_, test_namespace_name, kTableName, kValue4ColumnName, &conn));
+  ASSERT_OK(AddColumn(&test_cluster_, test_namespace_name, kTableName, kValue2ColumnName, &conn));
+  ASSERT_OK(WriteRows(
+      301 /* start */, 401 /* end */, &test_cluster_,
+      {kValue2ColumnName, kValue3ColumnName, kValue4ColumnName}));
+
+  // Precondition: with the schema caches warm the whole stream is readable. This is the control
+  // for the assertions below, and it is also what leaves last_streamed_op_id past replay_from.
+  auto warm_resp = ASSERT_RESULT(GetChangesFromCDC(stream_id, tablets, &replay_from));
+  ASSERT_GE(warm_resp.cdc_sdk_proto_records_size(), 400);
+
+  CHECK_OK(ASSERT_RESULT(test_cluster()->mini_master(0)->tablet_peer()->shared_tablet())
+                ->ForceManualRocksDBCompact());
+
+  auto result = GetChangesFromCDCWithoutRetry(stream_id, tablets, &replay_from);
+  // A failure here is the reproduction, and its status says which leg fired: "Schema packing not
+  // found: <v>" when the row's packing version was dropped along with the cached schema, and
+  // "Column id <n> not found" when the substituted current schema cannot name a column of the
+  // row's own packing (the DROP COLUMN era).
+  ASSERT_OK(result);
+  const GetChangesResponsePB& change_resp = *result;
+
+  uint32_t insert_count = 0;
+  for (const auto& record : change_resp.cdc_sdk_proto_records()) {
+    if (record.row_message().op() != RowMessage_Op::RowMessage_Op_INSERT) {
+      continue;
+    }
+    ++insert_count;
+    const auto key_value = record.row_message().new_tuple(0).datum_int32();
+    if (key_value >= 1 && key_value < 101) {
+      ASSERT_EQ(record.row_message().new_tuple_size(), 3);
+      // The initial era's rows must be named with the initial era's columns, not with the
+      // post-DROP/re-ADD column set that the fail-open would substitute.
+      std::vector<std::string> column_names;
+      for (int jdx = 0; jdx < record.row_message().new_tuple_size(); jdx++) {
+        column_names.push_back(record.row_message().new_tuple(jdx).column_name());
+      }
+      ASSERT_EQ(
+          column_names,
+          (std::vector<std::string>{kKeyColumnName, kValueColumnName, kValue2ColumnName}));
+    } else if (key_value >= 101 && key_value < 201) {
+      ASSERT_EQ(record.row_message().new_tuple_size(), 4);
+    } else if (key_value >= 201 && key_value < 301) {
+      ASSERT_EQ(record.row_message().new_tuple_size(), 3);
+    } else {
+      ASSERT_EQ(record.row_message().new_tuple_size(), 5);
+    }
+  }
+  ASSERT_EQ(insert_count, 400);
+}
+
 TEST_F(
     CDCSDKYsqlTest,
     YB_DISABLE_TEST_IN_TSAN(
