@@ -129,6 +129,17 @@ from yugabyte import artifact_upload  # noqa
 
 REPEAT_FAILURE_LIMIT = 50
 
+# Most new tests per build the --new_test_repetitions pass will repeat, mirroring
+# REPEAT_FAILURE_LIMIT above: one source change can create hundreds of new test names (a
+# parameterized instantiation, a renamed test binary), and repeating all of them would cost more
+# than the lane they ride on. Past the limit a sample of this size is repeated.
+NEW_TEST_LIMIT = 50
+
+# Least share of this build's tests the previous launch of the lane has to have reported for its
+# test list to be used as the baseline for "new". A launch that ended early reports a fraction of
+# its tests, and every test it never reached would otherwise read as new.
+NEW_TEST_MIN_KNOWN_RATIO = 0.9
+
 # The whole Spark application can be lost to autoscaled worker churn, e.g. while workers are
 # scaling in (symptom: "Master removed our application: FAILED"). Submit the job for the
 # not-yet-completed test attempts up to SPARK_JOB_MAX_SUBMITS times, re-creating the Spark context
@@ -1438,6 +1449,99 @@ def report_skipped_test(test_descriptor: yb_dist_tests.TestDescriptor) -> None:
     csi_report.close_item(csi_id, skip_time, 'skipped', ['muted'])
 
 
+# Run the tests this lane has never run before some more times, to find the ones that are flaky
+# from birth. A test that is flaky from the day it lands has no healthy history to be compared
+# against later, so its first failure cannot be told from a regression, and the lanes where that is
+# most likely (tsan, aarch64, mac) never see a change before it lands. One pass of the lane gives
+# each new test a single sample; this gives it --new_test_repetitions of them, cheaply, because the
+# build is already on the workers.
+#
+# Only tests that PASSED the main pass are repeated: a new test that failed already gets
+# --fail_repetitions re-runs, and repeating only the passing ones is what lets a consumer read
+# retry_kind=new_test_repetition on an item as "the first attempt passed" (csi_report.py).
+#
+# Deliberately nothing here can fail the build. The repetitions are evidence, not a gate: their
+# failures do not touch the exit code, and any error in this function is logged and dropped, so a
+# lane that would have passed still passes.
+def run_new_test_repetitions(args: argparse.Namespace,
+                             conf: yb_dist_tests.TestConfig,
+                             results: List[yb_dist_tests.TestResult],
+                             env_vars: Dict[str, str]) -> None:
+    reps = args.new_test_repetitions
+    if reps <= 1:
+        return
+    if (args.num_repetitions > 1 or args.test_list or args.ignore_list or args.max_tests or
+            args.test_filter_re or args.test_conf):
+        # Every one of these means this run is not the lane's own full pass over its own test
+        # list, so "the tests it did not run before" is not a question this run can answer.
+        logging.info("New-test repetitions: skipped, this is not a full run of the lane")
+        return
+    if g_spark_job_cancelled:
+        logging.info("New-test repetitions: skipped, the main pass was cancelled")
+        return
+
+    known = csi_report.previous_launch_unique_ids()
+    if known is None:
+        logging.info("New-test repetitions: skipped, no previous launch of this lane to compare "
+                     "against")
+        return
+    if len(known) < NEW_TEST_MIN_KNOWN_RATIO * len(results):
+        logging.info("New-test repetitions: skipped, the previous launch reported %d tests "
+                     "against %d run here, too few to tell new tests from unreached ones",
+                     len(known), len(results))
+        return
+
+    new_passed = []
+    num_new_failed = 0
+    for result in results:
+        if result.test_descriptor.descriptor_str_without_attempt_index in known:
+            continue
+        if result.exit_code == 0:
+            new_passed.append(result.test_descriptor)
+        else:
+            num_new_failed += 1
+    logging.info("New tests on this lane: %d passed, %d failed (the failed ones are re-run by "
+                 "--fail_repetitions)", len(new_passed), num_new_failed)
+    if not new_passed:
+        return
+
+    repeated = sorted(new_passed)
+    if len(repeated) > NEW_TEST_LIMIT:
+        # Seeded so the sample is reproducible from the build log alone.
+        repeated = sorted(random.Random(0).sample(repeated, NEW_TEST_LIMIT))
+        logging.info("New-test repetitions: %d new tests is over the limit of %d; repeating a "
+                     "sample of %d", len(new_passed), NEW_TEST_LIMIT, len(repeated))
+
+    test_descriptors = [
+        test_descriptor.with_attempt_index(i)
+        for test_descriptor in repeated
+        for i in range(2, reps + 1)
+    ]
+    log_heading("Running {} new tests {} more times each ({} test attempts)".format(
+        len(repeated), reps - 1, len(test_descriptors)))
+    # The same environment the main pass ran with, so the workers report into the same CSI suites,
+    # plus a marker csi_report.create_test reads for this job only: these executions are
+    # repetitions of a new test, not first attempts and not fail repetitions.
+    new_test_env_vars = dict(env_vars)
+    new_test_env_vars['YB_CSI_NEW_TEST'] = '1'
+    new_test_results = run_tests_job_with_resubmits(
+        test_descriptors, rerun=False, conf=conf, env_vars=new_test_env_vars)
+
+    num_failures_by_test: Dict[str, int] = defaultdict(int)
+    for result in new_test_results:
+        if result.exit_code != 0:
+            num_failures_by_test[result.test_descriptor.descriptor_str_without_attempt_index] += 1
+    logging.info("New-test repetitions: %d of %d test attempts produced a result, %d failed",
+                 len(new_test_results), len(test_descriptors), sum(num_failures_by_test.values()))
+    for test_descriptor in repeated:
+        num_failures = num_failures_by_test[test_descriptor.descriptor_str_without_attempt_index]
+        if num_failures > 0:
+            # The first attempt passed, so the failures are out of the reps runs of the test in
+            # this build.
+            logging.info("New test failed %d of its %d runs in this build: %s",
+                         num_failures, reps, test_descriptor.descriptor_str_without_attempt_index)
+
+
 def skip_disabled_tests(test_descriptors: List[yb_dist_tests.TestDescriptor],
                         disable_list_path: str) -> List[yb_dist_tests.TestDescriptor]:
 
@@ -1526,6 +1630,12 @@ def main() -> None:
                         help='Number of times to run each test.')
     parser.add_argument('--fail_repetitions', type=int, default=0,
                         help='Number of times to re-run each failure.')
+    parser.add_argument('--new_test_repetitions', type=int, default=0,
+                        help='Total number of times to run a test that is new on this lane: after '
+                             'the main pass, every test that this lane has not run before and '
+                             'that passed here is run this many times minus one more. 0 or 1 '
+                             'disables it. Requires CSI, which supplies the previous launch of '
+                             'the lane the new tests are new against.')
     parser.add_argument('--failed_test_list',
                         help='A file path to save the list of failed tests to. The format is '
                              'one test descriptor per line.')
@@ -1885,6 +1995,13 @@ def main() -> None:
                     "visible, instead of failed tests silently missing their retries.",
                     rerun_missing_cnt, len(test_descriptors_rerun))
                 global_exit_code = 1
+
+    try:
+        run_new_test_repetitions(args, conf, results, propagated_env_vars)
+    except Exception:
+        # Extra runs of new tests are evidence collected on the side. Losing them is not a reason
+        # to change the outcome of a build whose tests have already run.
+        logging.exception("New-test repetitions failed; continuing")
 
     for suite_name in csi_suites.keys():
         csi_report.close_item(csi_suites[suite_name], test_phase_end_time, '', [])
