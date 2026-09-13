@@ -251,4 +251,86 @@ TEST(PackedRowTest, ControlFields) {
   ASSERT_EQ(TestPackWithControlFields<RowPackerV2>(), "74817C00000C70726976657439");
 }
 
+// A nullable INT32 value column, optionally carrying the ADD COLUMN ... DEFAULT fast default that
+// SchemaPacking's ctor copies into ColumnPackingData::missing_value (schema_packing.cc:526).
+ColumnSchema MakeInt32ValueColumn(const std::string& name, std::optional<int32_t> missing_value) {
+  ColumnSchema column(name, DataType::INT32, ColumnKind::VALUE, Nullable::kTrue);
+  if (missing_value) {
+    QLValuePB value;
+    value.set_int32_value(*missing_value);
+    column.set_missing_value(value);
+  }
+  return column;
+}
+
+// RowPackerBase::CompleteColumns (packed_row.cc:348-368) sources missing_value for the LAST
+// unpacked column only; the gap loop it drives in DoAddValueImpl (packed_row.cc:423-448) walks
+// every intermediate unpacked column and packs nothing for it, never reading its missing_value.
+// Pack v1 of (v1, v2, v3) where v2 and v3 both have a fast default: v3 comes back with its default
+// (the control), v2 must too.
+template <class Packer, class Decoder>
+void TestMissingValuesForMultipleUnpackedColumns() {
+  constexpr int kVersion = 1;
+  constexpr int32_t kV1Value = 1;
+  constexpr int32_t kV2Missing = 5;
+  constexpr int32_t kV3Missing = 7;
+
+  SchemaBuilder builder;
+  ASSERT_OK(builder.AddHashKeyColumn("k", DataType::INT32));
+  ASSERT_OK(builder.AddColumn(MakeInt32ValueColumn("v1", std::nullopt)));
+  ASSERT_OK(builder.AddColumn(MakeInt32ValueColumn("v2", kV2Missing)));
+  ASSERT_OK(builder.AddColumn(MakeInt32ValueColumn("v3", kV3Missing)));
+  auto schema = builder.Build();
+
+  SchemaPacking packing(TableType::PGSQL_TABLE_TYPE, schema);
+
+  // Preconditions: three value columns, and the packing really carries both fast defaults.
+  ASSERT_EQ(packing.columns(), 3);
+  ASSERT_TRUE(IsNull(packing.column_packing_data(0).missing_value));
+  ASSERT_EQ(packing.column_packing_data(1).missing_value.int32_value(), kV2Missing);
+  ASSERT_EQ(packing.column_packing_data(2).missing_value.int32_value(), kV3Missing);
+
+  // The write a client sends when its column list predates the last two ALTER TABLE ... ADD COLUMN
+  // ... DEFAULT statements: only v1 is supplied.
+  Packer packer(
+      kVersion, packing, /* packed_size_limit= */ std::numeric_limits<int64_t>::max(),
+      /* value_control_fields= */ Slice());
+  QLValuePB v1_value;
+  v1_value.set_int32_value(kV1Value);
+  ASSERT_OK(packer.AddValue(packing.column_packing_data(0).id, v1_value));
+  auto packed = ASSERT_RESULT(packer.Complete());
+
+  ASSERT_EQ(static_cast<ValueEntryType>(packed.consume_byte()), Decoder::kValueEntryType);
+  ASSERT_EQ(ASSERT_RESULT(FastDecodeUnsignedVarInt(&packed)), kVersion);
+  Decoder decoder(packing, packed.data());
+
+  // PackedRowDecoderV2 is forward-only (CHECK_LE(next_idx_, idx), schema_packing.cc:1105), so
+  // decode every column in index order first and assert afterwards.
+  std::vector<QLValuePB> decoded;
+  for (size_t idx = 0; idx != packing.columns(); ++idx) {
+    decoded.push_back(ASSERT_RESULT(UnpackQLValue(decoder.FetchValue(idx), DataType::INT32)));
+  }
+
+  // Precondition: the supplied column round-trips.
+  ASSERT_FALSE(IsNull(decoded[0]));
+  ASSERT_EQ(decoded[0].int32_value(), kV1Value);
+
+  // Control (passes today): v3 is the last column, the only one CompleteColumns sources.
+  EXPECT_FALSE(IsNull(decoded[2])) << "v3 (last unpacked column) lost its missing value";
+  EXPECT_EQ(decoded[2].int32_value(), kV3Missing);
+
+  // The reproduction: v2 is an intermediate unpacked column, so it is packed as an explicit NULL.
+  EXPECT_FALSE(IsNull(decoded[1]))
+      << "v2 (intermediate unpacked column) was packed as an explicit NULL, not its missing value";
+  EXPECT_EQ(decoded[1].int32_value(), kV2Missing);
+}
+
+TEST(PackedRowTest, MissingValuesForMultipleUnpackedColumns) {
+  TestMissingValuesForMultipleUnpackedColumns<RowPackerV1, PackedRowDecoderV1>();
+}
+
+TEST(PackedRowTest, MissingValuesForMultipleUnpackedColumnsV2) {
+  TestMissingValuesForMultipleUnpackedColumns<RowPackerV2, PackedRowDecoderV2>();
+}
+
 } // namespace yb::dockv
