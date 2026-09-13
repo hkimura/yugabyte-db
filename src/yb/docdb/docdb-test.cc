@@ -15,7 +15,13 @@
 
 #include "yb/common/transaction.h"
 
+#include "yb/docdb/consensus_frontier.h"
+
+#include "yb/dockv/packed_row.h"
 #include "yb/dockv/reader_projection.h"
+#include "yb/dockv/schema_packing.h"
+
+#include "yb/gutil/casts.h"
 
 #include "yb/util/minmax.h"
 
@@ -743,6 +749,85 @@ TEST_F(DocDBMissingSchemaTest, ColocationNonTombstoneDroppedDuringPartialCompact
   const auto id = RandomUniformInt<ColocationId>(
       kFirstNormalColocationId, std::numeric_limits<ColocationId>::max() - 1);
   TestNonTombstoneDroppedDuringPartialCompaction(id, id + 1);
+}
+
+// DocDBRocksDBUtil is not only a test fixture: tools/yb-bulk_load.cc drives its BulkLoadDocDBUtil
+// subclass to build the SST files it then hands to a live tablet through Tablet::ImportData. This
+// fixture reproduces that writer's geometry.
+class DocDBBulkLoadWriterTest : public DocDBTestBase {
+ protected:
+  static constexpr SchemaVersion kSchemaVersion = 7;
+
+  Schema CreateSchema() override { return Schema(); }
+
+  // Builds a real V1 packed row and writes it at the row key - where packed rows live - then
+  // flushes, so the row lands in an SST.
+  void WritePackedRowAndFlush(const std::string& key) {
+    SchemaBuilder builder;
+    ASSERT_OK(builder.AddHashKeyColumn("h", DataType::INT32));
+    ASSERT_OK(builder.AddColumn("v", DataType::INT32));
+    auto schema = builder.Build();
+    dockv::SchemaPacking packing(TableType::YQL_TABLE_TYPE, schema);
+    dockv::RowPackerV1 packer(
+        kSchemaVersion, packing, std::numeric_limits<int64_t>::max(), Slice());
+    QLValuePB value;
+    value.set_int32_value(42);
+    ASSERT_OK(packer.AddValue(packing.column_packing_data(0).id, value));
+    Slice packed = ASSERT_RESULT(packer.Complete());
+    ASSERT_EQ(dockv::DecodeValueEntryType(packed), dockv::ValueEntryType::kPackedRowV1);
+
+    KeyBytes encoded_doc_key(dockv::MakeDocKey(key).Encode());
+    auto dwb = MakeDocWriteBatch();
+    ASSERT_OK(dwb.SetPrimitive(DocPath(encoded_doc_key), ValueRef(std::cref(packed))));
+
+    // Exactly BulkLoadTask::Run, tools/yb-bulk_load.cc:207-215.
+    ASSERT_OK(WriteToRocksDB(
+        dwb, HybridTime::FromMicros(kYugaByteMicrosecondEpoch),
+        /* decode_dockey= */ false, /* increment_write_id= */ false));
+    ASSERT_OK(FlushRocksDbAndWait(rocksdb::FlushReason::kYbBulkLoadTool));
+  }
+
+};
+
+// Control (passes at the pin): when op_id_ is set, DocDBRocksDBUtil::WriteToRocksDB
+// (docdb_util.cc:229-263) does build ConsensusFrontiers, so the flushed SST carries a
+// user_frontier. This isolates the reproduction below to the op-id-less branch.
+TEST_F(DocDBBulkLoadWriterTest, FrontierPresentWhenOpIdIsSet) {
+  op_id_ = rocksdb::OpId(1, 1);
+  ASSERT_NO_FATALS(WritePackedRowAndFlush("with_op_id"));
+
+  auto files = rocksdb()->GetLiveFilesMetaData();
+  ASSERT_EQ(files.size(), 1);
+  ASSERT_TRUE(files[0].smallest.user_frontier.get() != nullptr);
+}
+
+// packed_row:INV-2(a) - every path that durably writes packed values must record the referenced
+// schema versions into the SST frontiers, or the census that authorises packing GC is starved.
+// DocDBRocksDBUtil::WriteToRocksDB builds frontiers only `if (!op_id_.empty())`, and even then sets
+// nothing but op id and hybrid time; it never runs the used-schema-version recorder the real write
+// path uses (FrontierSchemaVersionUpdater::UpdateSchemaVersion / FlushSchemaVersion,
+// docdb/rocksdb_writer.cc:976-1050). BulkLoadDocDBUtil never sets op_id_ - the only assignments are
+// in the WriteSimple* test helpers (docdb_util.cc:316-317, 329-330) - so the tool's SSTs carry no
+// frontier at all, and RegularRocksDbListener::FillMinSchemaVersion (tablet/tablet.cc:726-732)
+// skips exactly those files.
+TEST_F(DocDBBulkLoadWriterTest, BulkLoadWriteRecordsUsedSchemaVersion) {
+  // Precondition: the bulk-load geometry. BulkLoadDocDBUtil never assigns op_id_.
+  ASSERT_TRUE(op_id_.empty());
+
+  ASSERT_NO_FATALS(WritePackedRowAndFlush("bulk_loaded"));
+
+  auto files = rocksdb()->GetLiveFilesMetaData();
+  ASSERT_EQ(files.size(), 1);
+  ASSERT_TRUE(files[0].smallest.user_frontier.get() != nullptr)
+      << "the SST holding a packed row has no user frontier at all, so the packing-GC census "
+         "cannot see the schema version it is packed at";
+
+  // Phrased exactly as the tablet's census phrases it (tablet.cc:715-733).
+  std::unordered_map<Uuid, SchemaVersion> census;
+  down_cast<ConsensusFrontier&>(*files[0].smallest.user_frontier)
+      .MakeExternalSchemaVersionsAtMost(&census);
+  ASSERT_TRUE(census.contains(Uuid::Nil()));
+  ASSERT_EQ(census[Uuid::Nil()], kSchemaVersion);
 }
 
 }  // namespace yb::docdb
