@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <fstream>
+#include <future>
 #include <optional>
 #include <thread>
 #include <string_view>
@@ -23,6 +24,7 @@
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
+#include "yb/client/snapshot_test_util.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/table_info.h"
 #include "yb/client/yb_table_name.h"
@@ -53,6 +55,7 @@
 #include "yb/tserver/tablet_server.h"
 
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_dump_helper.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_participant.h"
 
@@ -99,6 +102,7 @@ DECLARE_bool(TEST_skip_process_apply);
 DECLARE_bool(TEST_tablet_pause_apply_write_ops);
 DECLARE_bool(delete_intents_sst_files);
 DECLARE_bool(enable_automatic_tablet_splitting);
+DECLARE_bool(enable_colocated_table_tombstone_cache);
 DECLARE_bool(enable_tracing);
 DECLARE_bool(enable_wait_queues);
 DECLARE_bool(flush_rocksdb_on_shutdown);
@@ -1727,6 +1731,105 @@ TEST_F_EX(PgMiniTest, VerifyTombstoneTimeCache, PgMiniTestSingleNode) {
   ASSERT_FALSE(tombstone_time.has_value());
 }
 
+
+// A colocated table's drop writes a table tombstone (YBCDropTable), and a PITR schedule keeps the
+// dropped table in the tablet as a hidden table. The per-replica tombstone-time cache then makes
+// replicas disagree about that hidden table's rows, which is what a whole-tablet hash
+// (yb-ts-cli dump_tablet_data, the stress harness's XOR consistency check) reads:
+//  (a) a replica that cached "no tombstone" before the drop keeps returning the dropped rows for
+//      reads after the drop;
+//  (b) a replica that cached the tombstone after the drop applies it to reads whose read time
+//      predates the drop, returning no rows.
+// The drop here is the one a rewriting TRUNCATE performs on the old relfilenode, the path the
+// cross-DB DDL stress test exercises; a plain DROP TABLE takes the same path.
+TEST_F(PgMiniTest, HiddenColocatedTableTombstoneCacheDivergence) {
+  const std::string kDbName = "colo_db";
+  const std::string kTableName = "hidden_tombstone_test";
+  constexpr int kColocationId = 20001;
+  constexpr int64_t kNumRows = 50;
+
+  auto conn = ASSERT_RESULT(Connect());
+  ASSERT_OK(conn.ExecuteFormat("CREATE DATABASE $0 WITH colocated = true", kDbName));
+  conn = ASSERT_RESULT(ConnectToDB(kDbName));
+  ASSERT_OK(conn.ExecuteFormat(
+      "CREATE TABLE $0 (k INT PRIMARY KEY, v INT) WITH (colocation_id = $1)",
+      kTableName, kColocationId));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO $0 SELECT i, i FROM generate_series(1, $1) AS i", kTableName, kNumRows));
+  ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
+
+  // A PITR schedule makes the drop hide the table instead of removing it from the tablet.
+  client::SnapshotTestUtil snapshot_util(*cluster_, client_->proxy_cache());
+  ASSERT_RESULT(snapshot_util.CreateSchedule(kDbName, client::WaitSnapshot::kTrue, 60s, 600s));
+
+  const auto old_table_id = ASSERT_RESULT(GetTableIDFromTableName(kTableName));
+
+  // The three replicas of the colocated tablet that holds the table.
+  std::vector<tablet::TabletPeerPtr> peers;
+  for (const auto& peer : ListTabletPeers(cluster_.get(), ListPeersFilter::kAll)) {
+    if (peer->tablet_metadata()->colocated() &&
+        peer->tablet_metadata()->GetTableInfo(old_table_id).ok()) {
+      peers.push_back(peer);
+    }
+  }
+  ASSERT_EQ(peers.size(), 3);
+
+  // Hash one table of the tablet on one replica at one read time, the way
+  // yb-ts-cli dump_tablet_data HASH_ONLY does. Returns the row count.
+  auto count_rows = [&](const tablet::TabletPeerPtr& peer, HybridTime read_ht) -> Result<uint64_t> {
+    auto tablet = VERIFY_RESULT(peer->shared_tablet());
+    std::promise<client::YBClient*> client_promise;
+    client_promise.set_value(client_.get());
+    uint64_t xor_hash = 0;
+    uint64_t row_count = 0;
+    RETURN_NOT_OK(tablet::DumpTabletData(
+        *tablet, client_promise.get_future().share(), /* file = */ nullptr, read_ht.ToUint64(),
+        CoarseMonoClock::Now() + 30s, xor_hash, row_count, old_table_id));
+    return row_count;
+  };
+  auto cached_tombstone_time = [&](const tablet::TabletPeerPtr& peer) {
+    auto table_info = CHECK_RESULT(peer->tablet_metadata()->GetTableInfo(old_table_id));
+    return table_info->doc_read_context->table_tombstone_time();
+  };
+  auto& clock = *cluster_->mini_tablet_server(0)->server()->Clock();
+
+  // Warm the cache on replica A only, with a read before the drop: it caches "no tombstone".
+  ASSERT_EQ(ASSERT_RESULT(count_rows(peers[0], clock.Now())), kNumRows);
+  ASSERT_TRUE(cached_tombstone_time(peers[0]).has_value());
+  ASSERT_FALSE(cached_tombstone_time(peers[0])->is_valid());
+  ASSERT_FALSE(cached_tombstone_time(peers[1]).has_value());
+  ASSERT_FALSE(cached_tombstone_time(peers[2]).has_value());
+  const auto pre_drop_ht = clock.Now();
+
+  // Rewriting TRUNCATE: a new relfilenode for the table, and YBCDropTable writes the table
+  // tombstone on the old one, which the schedule keeps in the tablet as a hidden table.
+  ASSERT_OK(conn.Execute("SET yb_enable_alter_table_rewrite = true"));
+  ASSERT_OK(conn.ExecuteFormat("TRUNCATE $0", kTableName));
+  const auto new_table_id = ASSERT_RESULT(GetTableIDFromTableName(kTableName));
+  ASSERT_NE(new_table_id, old_table_id);
+  ASSERT_OK(WaitForAllIntentsApplied(cluster_.get()));
+  for (const auto& peer : peers) {
+    ASSERT_OK(peer->tablet_metadata()->GetTableInfo(old_table_id));
+  }
+
+  // (a) Replica A still returns the dropped rows after the drop.
+  EXPECT_EQ(ASSERT_RESULT(count_rows(peers[0], clock.Now())), 0);
+  // The cold replica B reads correctly at the current time and caches the tombstone.
+  ASSERT_EQ(ASSERT_RESULT(count_rows(peers[1], clock.Now())), 0);
+  ASSERT_TRUE(cached_tombstone_time(peers[1]).has_value());
+  ASSERT_TRUE(cached_tombstone_time(peers[1])->is_valid());
+  // (b) Replica B applies the cached tombstone to a read time that predates the drop.
+  EXPECT_EQ(ASSERT_RESULT(count_rows(peers[1], pre_drop_ht)), kNumRows);
+  // The cold replica C reads correctly at the same pre-drop time.
+  ASSERT_EQ(ASSERT_RESULT(count_rows(peers[2], pre_drop_ht)), kNumRows);
+
+  // Control: with the cache off, every replica agrees at both read times.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_colocated_table_tombstone_cache) = false;
+  for (const auto& peer : peers) {
+    EXPECT_EQ(ASSERT_RESULT(count_rows(peer, clock.Now())), 0);
+    EXPECT_EQ(ASSERT_RESULT(count_rows(peer, pre_drop_ht)), kNumRows);
+  }
+}
 
 TEST_F(PgMiniTest, SkipTableTombstoneCheckMetadata) {
   // Setup test data.
